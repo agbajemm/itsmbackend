@@ -104,7 +104,7 @@ namespace documentchecker.Controllers
             var apiClient = _httpClientFactory.CreateClient();
             apiClient.Timeout = TimeSpan.FromSeconds(60); // 60 seconds per request
 
-            int pageNumber = 1; // Declare here for scope across try/catch
+            int pageNumber = 1; 
             try
             {
                 using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(15)); // 15-minute total timeout
