@@ -180,7 +180,7 @@ namespace documentchecker.Controllers
                     };
                 }
 
-                while (hasMoreRows && pageNumber <= 10 && (maxTotalRecords == 0 || totalUnfiltered < maxTotalRecords))
+                while (hasMoreRows && pageNumber <= 50 && (maxTotalRecords == 0 || totalUnfiltered < maxTotalRecords))
                 {
                     var startTime = DateTime.UtcNow;
                     var listInfo = new
