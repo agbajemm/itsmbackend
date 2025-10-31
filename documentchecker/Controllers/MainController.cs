@@ -134,10 +134,12 @@ namespace documentchecker.Controllers
                 long? dateFromMs = null, dateToMs = null;
                 if (!string.IsNullOrEmpty(dateFrom) || !string.IsNullOrEmpty(dateTo))
                 {
-                    if (DateTime.TryParse(dateFrom, out var fromDate))
-                        dateFromMs = new DateTimeOffset(fromDate).ToUnixTimeMilliseconds();
-                    if (DateTime.TryParse(dateTo, out var toDate))
-                        dateToMs = new DateTimeOffset(toDate).ToUnixTimeMilliseconds();
+                    DateTime fromDate;
+                    if (DateTime.TryParse(dateFrom, out fromDate))
+                        dateFromMs = new DateTimeOffset(fromDate, TimeSpan.Zero).ToUnixTimeMilliseconds();
+                    DateTime toDate;
+                    if (DateTime.TryParse(dateTo, out toDate))
+                        dateToMs = new DateTimeOffset(toDate, TimeSpan.Zero).ToUnixTimeMilliseconds();
                     if (dateFromMs == null && dateToMs != null || dateFromMs != null && dateToMs == null)
                         return BadRequest("Both dateFrom and dateTo must be provided for date range filtering.");
                 }
@@ -180,7 +182,7 @@ namespace documentchecker.Controllers
                     };
                 }
 
-                while (hasMoreRows && pageNumber <= 50 && (maxTotalRecords == 0 || totalUnfiltered < maxTotalRecords))
+                while (hasMoreRows && pageNumber <= 10 && (maxTotalRecords == 0 || totalUnfiltered < maxTotalRecords))
                 {
                     var startTime = DateTime.UtcNow;
                     var listInfo = new
@@ -315,8 +317,9 @@ namespace documentchecker.Controllers
 
             try
             {
-                var dateTo = DateTime.UtcNow;
-                var dateFrom = dateTo.AddMonths(-months).Date;
+                var dateTo = DateTimeOffset.UtcNow;
+                var temp = dateTo.AddMonths(-months);
+                var dateFrom = new DateTimeOffset(temp.Year, temp.Month, temp.Day, 0, 0, 0, TimeSpan.Zero);
                 var requests = await FetchRequestsForDateRange(dateFrom, dateTo);
                 var topAreas = requests
                     .Where(req => req.TryGetValue("subject", out var subjObj) && subjObj != null && !string.IsNullOrEmpty(subjObj.ToString()))
@@ -355,8 +358,9 @@ namespace documentchecker.Controllers
                     .Select(t => t["name"].ToString().ToLowerInvariant())
                     .ToHashSet();
 
-                var dateTo = DateTime.UtcNow;
-                var dateFrom = dateTo.AddMonths(-months).Date;
+                var dateTo = DateTimeOffset.UtcNow;
+                var temp = dateTo.AddMonths(-months);
+                var dateFrom = new DateTimeOffset(temp.Year, temp.Month, temp.Day, 0, 0, 0, TimeSpan.Zero);
                 var requests = await FetchRequestsForDateRange(dateFrom, dateTo);
 
                 var assignedTechs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -383,7 +387,7 @@ namespace documentchecker.Controllers
             }
         }
 
-        private async Task<List<Dictionary<string, object>>> FetchRequestsForDateRange(DateTime dateFrom, DateTime dateTo)
+        private async Task<List<Dictionary<string, object>>> FetchRequestsForDateRange(DateTimeOffset dateFrom, DateTimeOffset dateTo)
         {
             var apiClient = _httpClientFactory.CreateClient();
             apiClient.Timeout = TimeSpan.FromSeconds(60);
@@ -391,8 +395,8 @@ namespace documentchecker.Controllers
             apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
                 "Zoho-oauthtoken", accessToken);
 
-            long dateFromMs = new DateTimeOffset(dateFrom).ToUnixTimeMilliseconds();
-            long dateToMs = new DateTimeOffset(dateTo).ToUnixTimeMilliseconds();
+            long dateFromMs = dateFrom.ToUnixTimeMilliseconds();
+            long dateToMs = dateTo.ToUnixTimeMilliseconds();
 
             var searchCriteria = new
             {
