@@ -12,6 +12,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web; // For URL encoding
+using System.Text.Json.Nodes;
 
 namespace documentchecker.Controllers
 {
@@ -21,17 +22,23 @@ namespace documentchecker.Controllers
     {
         private readonly string _projectEndpoint;
         private readonly string _agentId;
-        private readonly string _zohoToken;
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly IMemoryCache _cache;
+        private readonly string _clientId;
+        private readonly string _clientSecret;
+        private readonly string _refreshToken;
+        private readonly string _redirectUri;
 
         public MainController(IConfiguration configuration, IHttpClientFactory httpClientFactory, IMemoryCache cache)
         {
             _projectEndpoint = configuration["AzureAIFoundry:ProjectEndpoint"] ?? throw new InvalidOperationException("ProjectEndpoint not configured.");
             _agentId = configuration["AzureAIFoundry:AgentId"] ?? "asst_MqwY6PBQdS9uxha6Hl1RQCJk";
-            _zohoToken = configuration["ZohoOAuthToken"] ?? throw new InvalidOperationException("ZohoOAuthToken not configured.");
             _httpClientFactory = httpClientFactory;
             _cache = cache;
+            _clientId = configuration["Zoho:ClientId"] ?? throw new InvalidOperationException("Zoho:ClientId not configured.");
+            _clientSecret = configuration["Zoho:ClientSecret"] ?? throw new InvalidOperationException("Zoho:ClientSecret not configured.");
+            _refreshToken = configuration["Zoho:RefreshToken"] ?? throw new InvalidOperationException("Zoho:RefreshToken not configured.");
+            _redirectUri = configuration["Zoho:RedirectUri"] ?? throw new InvalidOperationException("Zoho:RedirectUri not configured.");
         }
 
         [HttpPost("agent-chat")]
@@ -104,25 +111,25 @@ namespace documentchecker.Controllers
             var apiClient = _httpClientFactory.CreateClient();
             apiClient.Timeout = TimeSpan.FromSeconds(60); // 60 seconds per request
 
-            int pageNumber = 1; 
+            int pageNumber = 1;
             try
             {
-                using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(15)); // 15-minute total timeout
+                string accessToken = await GetAccessTokenAsync();
+
+                using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
                 await LogDetails(logger, "Start", new { Timestamp = DateTime.UtcNow, Details = "Fetching requests from ManageEngine API" });
 
                 apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
-                    "Zoho-oauthtoken", _zohoToken);
+                    "Zoho-oauthtoken", accessToken);
 
-                // Use List for ordered collection (newest-first) + HashSet for fast dedup by ID
                 var allRequests = new List<Dictionary<string, object>>();
                 var seenIds = new HashSet<string>();
-                int totalRows = 0;
+                int totalUnfiltered = 0;
                 bool hasMoreRows = true;
                 int consecutiveEmptyPages = 0;
                 const int emptyPageThreshold = 5;
-                const int rowCount = 100; // Max allowed per page
-                // OPTIONAL: Add max total records limit to stop early (e.g., only fetch 500 latest)
-                const int maxTotalRecords = 0; // Set to >0 for limit
+                const int rowCount = 100;
+                const int maxTotalRecords = 500;
 
                 long? dateFromMs = null, dateToMs = null;
                 if (!string.IsNullOrEmpty(dateFrom) || !string.IsNullOrEmpty(dateTo))
@@ -135,7 +142,6 @@ namespace documentchecker.Controllers
                         return BadRequest("Both dateFrom and dateTo must be provided for date range filtering.");
                 }
 
-                // Build search_criteria dynamically based on filters (AND logic by default)
                 var searchCriteriaList = new List<object>();
                 if (!string.IsNullOrEmpty(subject))
                 {
@@ -167,16 +173,17 @@ namespace documentchecker.Controllers
                 object? searchCriteria = null;
                 if (searchCriteriaList.Count > 0)
                 {
-                    searchCriteria = searchCriteriaList.Count == 1 ? searchCriteriaList[0] : searchCriteriaList;
+                    searchCriteria = searchCriteriaList.Count == 1 ? searchCriteriaList[0] : new
+                    {
+                        logical_operator = "AND",
+                        children = searchCriteriaList
+                    };
                 }
 
-                // Collect all unique requests first (in desc order, filtered server-side)
-                while (hasMoreRows && pageNumber <= 10 && (maxTotalRecords == 0 || totalRows < maxTotalRecords))
+                while (hasMoreRows && pageNumber <= 10 && (maxTotalRecords == 0 || totalUnfiltered < maxTotalRecords))
                 {
                     var startTime = DateTime.UtcNow;
-                    // FIXED: Build input_data as anonymous object and serialize once (avoids nested interpolation errors)
-                    // Renamed to payloadListInfo to avoid variable name conflict with parsing
-                    var payloadListInfo = new
+                    var listInfo = new
                     {
                         row_count = rowCount,
                         start_index = (pageNumber - 1) * rowCount,
@@ -185,7 +192,7 @@ namespace documentchecker.Controllers
                         get_total_count = true,
                         search_criteria = searchCriteria
                     };
-                    var inputData = new { list_info = payloadListInfo };
+                    var inputData = new { list_info = listInfo };
                     var inputDataJson = JsonSerializer.Serialize(inputData, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
                     var encodedInputData = HttpUtility.UrlEncode(inputDataJson);
                     string url = $"https://sdpondemand.manageengine.com/api/v3/requests?input_data={encodedInputData}";
@@ -193,81 +200,89 @@ namespace documentchecker.Controllers
 
                     if (!response.IsSuccessStatusCode)
                     {
-                        var errorDetails = new { StatusCode = (int)response.StatusCode, Reason = response.ReasonPhrase, Page = pageNumber };
-                        await LogDetails(logger, "Failure", errorDetails);
-                        // FIXED: Retry with reduced row_count (same structure)
-                        var reducedRowCount = Math.Min(rowCount / 2, 50);
-                        var retryPayloadListInfo = new
+                        if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
                         {
-                            row_count = reducedRowCount,
-                            start_index = (pageNumber - 1) * rowCount,
-                            sort_field = "created_time",
-                            sort_order = "desc",
-                            get_total_count = true,
-                            search_criteria = searchCriteria
-                        };
-                        var retryInputData = new { list_info = retryPayloadListInfo };
-                        var retryInputDataJson = JsonSerializer.Serialize(retryInputData, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
-                        var retryEncodedInputData = HttpUtility.UrlEncode(retryInputDataJson);
-                        url = $"https://sdpondemand.manageengine.com/api/v3/requests?input_data={retryEncodedInputData}";
-                        response = await apiClient.GetAsync(url, cts.Token);
+                            _cache.Remove("ZohoAccessToken");
+                            _cache.Remove("ZohoTokenExpiration");
+                            accessToken = await GetAccessTokenAsync();
+                            apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
+                                "Zoho-oauthtoken", accessToken);
+                            response = await apiClient.GetAsync(url, cts.Token);
+                        }
 
                         if (!response.IsSuccessStatusCode)
                         {
-                            // Final fallback (no sorting or filtering guaranteed)
-                            url = "https://sdpondemand.manageengine.com/api/v3/requests";
+                            var errorDetails = new { StatusCode = (int)response.StatusCode, Reason = response.ReasonPhrase, Page = pageNumber };
+                            await LogDetails(logger, "Failure", errorDetails);
+
+                            var reducedRowCount = Math.Min(rowCount / 2, 50);
+                            listInfo = new
+                            {
+                                row_count = reducedRowCount,
+                                start_index = (pageNumber - 1) * rowCount,
+                                sort_field = "created_time",
+                                sort_order = "desc",
+                                get_total_count = true,
+                                search_criteria = searchCriteria
+                            };
+                            inputData = new { list_info = listInfo };
+                            inputDataJson = JsonSerializer.Serialize(inputData, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+                            encodedInputData = HttpUtility.UrlEncode(inputDataJson);
+                            url = $"https://sdpondemand.manageengine.com/api/v3/requests?input_data={encodedInputData}";
                             response = await apiClient.GetAsync(url, cts.Token);
+
                             if (!response.IsSuccessStatusCode)
-                                return StatusCode((int)response.StatusCode, new { Error = $"API request failed on page {pageNumber}: {response.ReasonPhrase}" });
+                            {
+                                url = "https://sdpondemand.manageengine.com/api/v3/requests";
+                                response = await apiClient.GetAsync(url, cts.Token);
+                                if (!response.IsSuccessStatusCode)
+                                    return StatusCode((int)response.StatusCode, new { Error = $"API request failed on page {pageNumber}: {response.ReasonPhrase}" });
+                            }
                         }
                     }
 
                     string jsonResponse = await response.Content.ReadAsStringAsync(cts.Token);
                     var data = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonResponse) ?? new Dictionary<string, object>();
-                    var requests = data.ContainsKey("requests") ? (JsonElement)data["requests"] : JsonDocument.Parse("[]").RootElement;
-                    var currentRequests = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(requests.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new List<Dictionary<string, object>>(rowCount);
+                    var requestsElem = data.ContainsKey("requests") ? (JsonElement)data["requests"] : JsonDocument.Parse("[]").RootElement;
+                    var currentRequests = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(requestsElem.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new List<Dictionary<string, object>>();
 
-                    // Add to ordered List if ID not seen (preserves newest-first insertion order)
                     int rowsThisPage = 0;
                     foreach (var req in currentRequests)
                     {
                         if (req.TryGetValue("id", out var idObj) && seenIds.Add(idObj.ToString()))
                         {
                             allRequests.Add(req);
-                            totalRows++;
+                            totalUnfiltered++;
                             rowsThisPage++;
                         }
                     }
 
-                    // FIXED: Extract hasMoreRows check to separate statements to avoid pattern matching issues and variable conflicts
                     hasMoreRows = false;
-                    if (data.TryGetValue("list_info", out var listInfoObjObj) &&
-                        listInfoObjObj is JsonElement listInfoElem &&
-                        listInfoElem.TryGetProperty("has_more_rows", out var hasMoreProp) &&
-                        hasMoreProp.GetBoolean())
+                    if (data.TryGetValue("list_info", out var listInfoObj) && listInfoObj is JsonElement listInfoElem)
                     {
-                        hasMoreRows = true;
+                        if (listInfoElem.TryGetProperty("has_more_rows", out var hasMoreProp))
+                        {
+                            hasMoreRows = hasMoreProp.GetBoolean();
+                        }
                     }
 
-                    // Track consecutive empty pages
                     if (rowsThisPage == 0) consecutiveEmptyPages++;
                     else consecutiveEmptyPages = 0;
 
                     var elapsedMs = (int)(DateTime.UtcNow - startTime).TotalMilliseconds;
-                    await LogDetails(logger, "PageFetched", new { PageNumber = pageNumber, RowsThisPage = rowsThisPage, HasMoreRows = hasMoreRows, TotalRowsSoFar = totalRows, ElapsedMs = elapsedMs });
+                    await LogDetails(logger, "PageFetched", new { PageNumber = pageNumber, RowsThisPage = rowsThisPage, HasMoreRows = hasMoreRows, TotalUnfilteredSoFar = totalUnfiltered, ElapsedMs = elapsedMs });
 
                     pageNumber++;
                     if (hasMoreRows && consecutiveEmptyPages < emptyPageThreshold) await Task.Delay(50, cts.Token);
                     else if (consecutiveEmptyPages >= emptyPageThreshold) hasMoreRows = false;
                 }
 
-                // No client-side filtering needed - allRequests are already filtered server-side
-                var filteredRequests = allRequests; // Already ordered newest-first
+                var filteredRequests = allRequests;
 
                 var resultDetails = new
                 {
                     TotalPages = pageNumber - 1,
-                    TotalRows = totalRows,
+                    TotalUnfilteredRows = totalUnfiltered,
                     FilteredRowsCount = filteredRequests.Count,
                     Timestamp = DateTime.UtcNow
                 };
@@ -304,12 +319,8 @@ namespace documentchecker.Controllers
                 var dateFrom = dateTo.AddMonths(-months).Date;
                 var requests = await FetchRequestsForDateRange(dateFrom, dateTo);
                 var topAreas = requests
-                    .Where(req => req.TryGetValue("subject", out var subjObj) && !string.IsNullOrEmpty(subjObj?.ToString()))
-                    .GroupBy(req =>
-                    {
-                        req.TryGetValue("subject", out var subjectObj);
-                        return subjectObj?.ToString()?.ToLowerInvariant() ?? string.Empty;
-                    })
+                    .Where(req => req.TryGetValue("subject", out var subjObj) && subjObj != null && !string.IsNullOrEmpty(subjObj.ToString()))
+                    .GroupBy(req => req["subject"].ToString().ToLowerInvariant())
                     .Select(g => new { Subject = g.Key, Count = g.Count() })
                     .OrderByDescending(x => x.Count)
                     .Take(10)
@@ -340,12 +351,8 @@ namespace documentchecker.Controllers
             {
                 var allTechnicians = await FetchAllTechnicians();
                 var allTechNames = allTechnicians
-                    .Where(t => t.TryGetValue("name", out var nameObj) && !string.IsNullOrEmpty(nameObj?.ToString()))
-                    .Select(t =>
-                    {
-                        t.TryGetValue("name", out var techNameObj);
-                        return techNameObj?.ToString()?.ToLowerInvariant() ?? string.Empty;
-                    })
+                    .Where(t => t.TryGetValue("name", out var nameObj) && nameObj != null && !string.IsNullOrEmpty(nameObj.ToString()))
+                    .Select(t => t["name"].ToString().ToLowerInvariant())
                     .ToHashSet();
 
                 var dateTo = DateTime.UtcNow;
@@ -357,9 +364,9 @@ namespace documentchecker.Controllers
                 {
                     if (req.TryGetValue("technician", out var techObj) && techObj is JsonElement techElem && techElem.ValueKind == JsonValueKind.Object)
                     {
-                        if (techElem.TryGetProperty("name", out var nameProp) && nameProp.ValueKind != JsonValueKind.Null)
+                        if (techElem.TryGetProperty("name", out var nameProp) && nameProp.ValueKind != JsonValueKind.Null && !string.IsNullOrEmpty(nameProp.GetString()))
                         {
-                            assignedTechs.Add(nameProp.GetString()?.ToLowerInvariant() ?? string.Empty);
+                            assignedTechs.Add(nameProp.GetString().ToLowerInvariant());
                         }
                     }
                 }
@@ -380,8 +387,9 @@ namespace documentchecker.Controllers
         {
             var apiClient = _httpClientFactory.CreateClient();
             apiClient.Timeout = TimeSpan.FromSeconds(60);
+            string accessToken = await GetAccessTokenAsync();
             apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
-                "Zoho-oauthtoken", _zohoToken);
+                "Zoho-oauthtoken", accessToken);
 
             long dateFromMs = new DateTimeOffset(dateFrom).ToUnixTimeMilliseconds();
             long dateToMs = new DateTimeOffset(dateTo).ToUnixTimeMilliseconds();
@@ -401,9 +409,9 @@ namespace documentchecker.Controllers
 
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
 
-            while (hasMoreRows && pageNumber <= 10)
+            while (hasMoreRows)
             {
-                var payloadListInfo = new
+                var listInfo = new
                 {
                     row_count = rowCount,
                     start_index = (pageNumber - 1) * rowCount,
@@ -412,7 +420,7 @@ namespace documentchecker.Controllers
                     get_total_count = true,
                     search_criteria = searchCriteria
                 };
-                var inputData = new { list_info = payloadListInfo };
+                var inputData = new { list_info = listInfo };
                 var inputDataJson = JsonSerializer.Serialize(inputData, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
                 var encodedInputData = HttpUtility.UrlEncode(inputDataJson);
                 string url = $"https://sdpondemand.manageengine.com/api/v3/requests?input_data={encodedInputData}";
@@ -420,9 +428,25 @@ namespace documentchecker.Controllers
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    // Fallback without input_data
-                    url = "https://sdpondemand.manageengine.com/api/v3/requests";
-                    response = await apiClient.GetAsync(url, cts.Token);
+                    if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                    {
+                        _cache.Remove("ZohoAccessToken");
+                        _cache.Remove("ZohoTokenExpiration");
+                        accessToken = await GetAccessTokenAsync();
+                        apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
+                            "Zoho-oauthtoken", accessToken);
+                        response = await apiClient.GetAsync(url, cts.Token);
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        url = "https://sdpondemand.manageengine.com/api/v3/requests";
+                        response = await apiClient.GetAsync(url, cts.Token);
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            throw new Exception($"Failed to fetch requests: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
+                        }
+                    }
                 }
 
                 string jsonResponse = await response.Content.ReadAsStringAsync(cts.Token);
@@ -438,10 +462,14 @@ namespace documentchecker.Controllers
                     }
                 }
 
-                hasMoreRows = data.TryGetValue("list_info", out var listInfoObjObj) &&
-                              listInfoObjObj is JsonElement listInfoElem &&
-                              listInfoElem.TryGetProperty("has_more_rows", out var hasMoreProp) &&
-                              hasMoreProp.GetBoolean();
+                hasMoreRows = false;
+                if (data.TryGetValue("list_info", out var listInfoObj) && listInfoObj is JsonElement listInfoElem)
+                {
+                    if (listInfoElem.TryGetProperty("has_more_rows", out var hasMoreProp))
+                    {
+                        hasMoreRows = hasMoreProp.GetBoolean();
+                    }
+                }
 
                 pageNumber++;
             }
@@ -452,18 +480,23 @@ namespace documentchecker.Controllers
         private async Task<List<Dictionary<string, object>>> FetchAllTechnicians()
         {
             var cacheKey = "all-technicians";
-            if (_cache.TryGetValue(cacheKey, out List<Dictionary<string, object>>? cachedTechs))
+            if (_cache.TryGetValue(cacheKey, out List<Dictionary<string, object>> cachedTechs))
             {
                 return cachedTechs;
             }
 
             var apiClient = _httpClientFactory.CreateClient();
             apiClient.Timeout = TimeSpan.FromSeconds(60);
+            string accessToken = await GetAccessTokenAsync();
             apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
-                "Zoho-oauthtoken", _zohoToken);
+                "Zoho-oauthtoken", accessToken);
 
-            // FIXED: Use search_fields: {"is_technician": "true"} for filtering technicians
-            var searchFields = new { is_technician = "true" };
+            var searchCriteria = new
+            {
+                field = "is_technician",
+                condition = "is",
+                value = true
+            };
 
             var allTechnicians = new List<Dictionary<string, object>>();
             var seenIds = new HashSet<string>();
@@ -473,18 +506,18 @@ namespace documentchecker.Controllers
 
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
 
-            while (hasMoreRows && pageNumber <= 5)
+            while (hasMoreRows)
             {
-                var payloadListInfo = new
+                var listInfo = new
                 {
                     row_count = rowCount,
-                    start_index = (pageNumber - 1) * rowCount + 1, // 1-based index
+                    start_index = (pageNumber - 1) * rowCount,
                     sort_field = "name",
                     sort_order = "asc",
                     get_total_count = true,
-                    search_fields = searchFields
+                    search_criteria = searchCriteria
                 };
-                var inputData = new { list_info = payloadListInfo };
+                var inputData = new { list_info = listInfo };
                 var inputDataJson = JsonSerializer.Serialize(inputData, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
                 var encodedInputData = HttpUtility.UrlEncode(inputDataJson);
                 string url = $"https://sdpondemand.manageengine.com/api/v3/users?input_data={encodedInputData}";
@@ -492,23 +525,33 @@ namespace documentchecker.Controllers
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    // Fallback: Simple query param if supported, or without filter and client-side
-                    url = "https://sdpondemand.manageengine.com/api/v3/users";
-                    response = await apiClient.GetAsync(url, cts.Token);
+                    if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                    {
+                        _cache.Remove("ZohoAccessToken");
+                        _cache.Remove("ZohoTokenExpiration");
+                        accessToken = await GetAccessTokenAsync();
+                        apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
+                            "Zoho-oauthtoken", accessToken);
+                        response = await apiClient.GetAsync(url, cts.Token);
+                    }
+
                     if (!response.IsSuccessStatusCode)
                     {
-                        throw new Exception($"Failed to fetch users: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
+                        url = "https://sdpondemand.manageengine.com/api/v3/users";
+                        response = await apiClient.GetAsync(url, cts.Token);
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            throw new Exception($"Failed to fetch users: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
+                        }
                     }
                 }
 
                 string jsonResponse = await response.Content.ReadAsStringAsync(cts.Token);
                 var data = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonResponse) ?? new Dictionary<string, object>();
-                // FIXED: Use "users" key for the array
-                var techniciansElem = data.ContainsKey("users") ? (JsonElement)data["users"] : JsonDocument.Parse("[]").RootElement;
-                var currentTechnicians = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(techniciansElem.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new List<Dictionary<string, object>>();
+                var usersElem = data.ContainsKey("users") ? (JsonElement)data["users"] : JsonDocument.Parse("[]").RootElement;
+                var currentUsers = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(usersElem.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new List<Dictionary<string, object>>();
 
-                // Client-side filter if fallback (no search_fields)
-                var filteredTechs = currentTechnicians.Where(tech => tech.TryGetValue("is_technician", out var isTechObj) && bool.TryParse(isTechObj?.ToString(), out bool isTech) && isTech).ToList();
+                var filteredTechs = currentUsers.Where(user => user.TryGetValue("is_technician", out var isTechObj) && bool.TryParse(isTechObj.ToString(), out bool isTech) && isTech).ToList();
 
                 foreach (var tech in filteredTechs)
                 {
@@ -518,29 +561,89 @@ namespace documentchecker.Controllers
                     }
                 }
 
-                // FIXED: Use list_info for has_more_rows or total_count for pagination
                 hasMoreRows = false;
-                if (data.TryGetValue("list_info", out var listInfoObjObj) &&
-                    listInfoObjObj is JsonElement listInfoElem &&
-                    listInfoElem.TryGetProperty("has_more_rows", out var hasMoreProp) &&
-                    hasMoreProp.GetBoolean())
+                if (data.TryGetValue("list_info", out var listInfoObj) && listInfoObj is JsonElement listInfoElem)
                 {
-                    hasMoreRows = true;
-                }
-                else if (data.TryGetValue("list_info", out var liObj) &&
-                         liObj is JsonElement liElem &&
-                         liElem.TryGetProperty("total_count", out var totalProp) &&
-                         totalProp.TryGetInt32(out int total) &&
-                         (pageNumber - 1) * rowCount + filteredTechs.Count < total)
-                {
-                    hasMoreRows = true;
+                    if (listInfoElem.TryGetProperty("has_more_rows", out var hasMoreProp))
+                    {
+                        hasMoreRows = hasMoreProp.GetBoolean();
+                    }
+                    else if (listInfoElem.TryGetProperty("total_count", out var totalProp) && totalProp.TryGetInt64(out long total) && allTechnicians.Count < total)
+                    {
+                        hasMoreRows = true;
+                    }
                 }
 
                 pageNumber++;
             }
 
-            _cache.Set(cacheKey, allTechnicians, TimeSpan.FromDays(30)); // Cache technicians longer, as they change less frequently
+            _cache.Set(cacheKey, allTechnicians, TimeSpan.FromDays(30));
             return allTechnicians;
+        }
+
+        private async Task<string> GetAccessTokenAsync()
+        {
+            const string tokenCacheKey = "ZohoAccessToken";
+            const string expirationCacheKey = "ZohoTokenExpiration";
+
+            if (_cache.TryGetValue(tokenCacheKey, out string cachedToken) &&
+                _cache.TryGetValue(expirationCacheKey, out DateTime cachedExpiration) &&
+                DateTime.UtcNow < cachedExpiration)
+            {
+                return cachedToken;
+            }
+
+            try
+            {
+                var client = _httpClientFactory.CreateClient();
+                var formContent = new FormUrlEncodedContent(new[]
+                {
+                    new KeyValuePair<string, string>("refresh_token", _refreshToken),
+                    new KeyValuePair<string, string>("grant_type", "refresh_token"),
+                    new KeyValuePair<string, string>("client_id", _clientId),
+                    new KeyValuePair<string, string>("client_secret", _clientSecret),
+                    new KeyValuePair<string, string>("redirect_uri", _redirectUri)
+                });
+
+                var response = await client.PostAsync("https://accounts.zoho.com/oauth/v2/token", formContent);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new Exception($"Failed to refresh Zoho access token: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
+                }
+
+                string jsonResponse = await response.Content.ReadAsStringAsync();
+                var data = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonResponse) ?? throw new Exception("Invalid response from Zoho token endpoint.");
+
+                if (data.TryGetValue("error", out var errorObj))
+                {
+                    throw new Exception($"Zoho token error: {errorObj}");
+                }
+
+                if (!data.TryGetValue("access_token", out var accessTokenObj) || accessTokenObj == null)
+                {
+                    throw new Exception("Access token not found in Zoho response.");
+                }
+
+                string accessToken = accessTokenObj.ToString()!;
+
+                int expiresIn = 3600;
+                if (data.TryGetValue("expires_in", out var expiresInObj) && int.TryParse(expiresInObj.ToString(), out int parsedExpiresIn))
+                {
+                    expiresIn = parsedExpiresIn;
+                }
+
+                var expiration = DateTime.UtcNow.AddSeconds(expiresIn - 60);
+                _cache.Set(tokenCacheKey, accessToken, new MemoryCacheEntryOptions { AbsoluteExpiration = expiration });
+                _cache.Set(expirationCacheKey, expiration, new MemoryCacheEntryOptions { AbsoluteExpiration = expiration });
+
+                return accessToken;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error refreshing Zoho token: {ex.Message}");
+                throw;
+            }
         }
 
         private async Task LogDetails(HttpClient logger, string eventType, object details)
