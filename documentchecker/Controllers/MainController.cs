@@ -144,42 +144,50 @@ namespace documentchecker.Controllers
                         return BadRequest("Both dateFrom and dateTo must be provided for date range filtering.");
                 }
 
-                var searchCriteriaList = new List<object>();
+                var searchCriteriaList = new List<Dictionary<string, object>>();
                 if (!string.IsNullOrEmpty(subject))
                 {
-                    searchCriteriaList.Add(new
+                    searchCriteriaList.Add(new Dictionary<string, object>
                     {
-                        field = "subject",
-                        condition = "contains",
-                        values = new[] { subject }
+                        ["field"] = "subject",
+                        ["condition"] = "contains",
+                        ["values"] = new[] { subject }
                     });
                 }
                 if (!string.IsNullOrEmpty(technician))
                 {
-                    searchCriteriaList.Add(new
+                    searchCriteriaList.Add(new Dictionary<string, object>
                     {
-                        field = "technician.name",
-                        condition = "contains",
-                        values = new[] { technician }
+                        ["field"] = "technician.name",
+                        ["condition"] = "contains",
+                        ["values"] = new[] { technician }
                     });
                 }
                 if (dateFromMs != null && dateToMs != null)
                 {
-                    searchCriteriaList.Add(new
+                    searchCriteriaList.Add(new Dictionary<string, object>
                     {
-                        field = "created_time",
-                        condition = "between",
-                        values = new[] { dateFromMs.ToString(), dateToMs.ToString() }
+                        ["field"] = "created_time",
+                        ["condition"] = "between",
+                        ["values"] = new[] { dateFromMs.ToString(), dateToMs.ToString() }
                     });
                 }
+
                 object? searchCriteria = null;
                 if (searchCriteriaList.Count > 0)
                 {
-                    searchCriteria = searchCriteriaList.Count == 1 ? searchCriteriaList[0] : new
+                    if (searchCriteriaList.Count == 1)
                     {
-                        logical_operator = "AND",
-                        children = searchCriteriaList
-                    };
+                        searchCriteria = searchCriteriaList[0];
+                    }
+                    else
+                    {
+                        for (int i = 1; i < searchCriteriaList.Count; i++)
+                        {
+                            searchCriteriaList[i]["logical_operator"] = "and";
+                        }
+                        searchCriteria = searchCriteriaList;
+                    }
                 }
 
                 while (hasMoreRows && pageNumber <= 10 && (maxTotalRecords == 0 || totalUnfiltered < maxTotalRecords))
@@ -398,12 +406,17 @@ namespace documentchecker.Controllers
             long dateFromMs = dateFrom.ToUnixTimeMilliseconds();
             long dateToMs = dateTo.ToUnixTimeMilliseconds();
 
-            var searchCriteria = new
+            var searchCriteriaList = new List<Dictionary<string, object>>
             {
-                field = "created_time",
-                condition = "between",
-                values = new[] { dateFromMs.ToString(), dateToMs.ToString() }
+                new Dictionary<string, object>
+                {
+                    ["field"] = "created_time",
+                    ["condition"] = "between",
+                    ["values"] = new[] { dateFromMs.ToString(), dateToMs.ToString() }
+                }
             };
+
+            object searchCriteria = searchCriteriaList;
 
             var allRequests = new List<Dictionary<string, object>>();
             var seenIds = new HashSet<string>();
@@ -489,96 +502,22 @@ namespace documentchecker.Controllers
                 return cachedTechs;
             }
 
-            var apiClient = _httpClientFactory.CreateClient();
-            apiClient.Timeout = TimeSpan.FromSeconds(60);
-            string accessToken = await GetAccessTokenAsync();
-            apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
-                "Zoho-oauthtoken", accessToken);
-
-            var searchCriteria = new
-            {
-                field = "is_technician",
-                condition = "is",
-                value = true
-            };
+            var dateTo = DateTimeOffset.UtcNow;
+            var dateFrom = new DateTimeOffset(2000, 1, 1, 0, 0, 0, TimeSpan.Zero);
+            var requests = await FetchRequestsForDateRange(dateFrom, dateTo);
 
             var allTechnicians = new List<Dictionary<string, object>>();
             var seenIds = new HashSet<string>();
-            bool hasMoreRows = true;
-            int pageNumber = 1;
-            const int rowCount = 100;
-
-            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
-
-            while (hasMoreRows)
+            foreach (var req in requests)
             {
-                var listInfo = new
+                if (req.TryGetValue("technician", out var techObj) && techObj is JsonElement techElem && techElem.ValueKind == JsonValueKind.Object)
                 {
-                    row_count = rowCount,
-                    start_index = (pageNumber - 1) * rowCount,
-                    sort_field = "name",
-                    sort_order = "asc",
-                    get_total_count = true,
-                    search_criteria = searchCriteria
-                };
-                var inputData = new { list_info = listInfo };
-                var inputDataJson = JsonSerializer.Serialize(inputData, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
-                var encodedInputData = HttpUtility.UrlEncode(inputDataJson);
-                string url = $"https://sdpondemand.manageengine.com/api/v3/users?input_data={encodedInputData}";
-                var response = await apiClient.GetAsync(url, cts.Token);
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                    var techDict = JsonSerializer.Deserialize<Dictionary<string, object>>(techElem.GetRawText());
+                    if (techDict.TryGetValue("id", out var idObj) && seenIds.Add(idObj.ToString()))
                     {
-                        _cache.Remove("ZohoAccessToken");
-                        _cache.Remove("ZohoTokenExpiration");
-                        accessToken = await GetAccessTokenAsync();
-                        apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
-                            "Zoho-oauthtoken", accessToken);
-                        response = await apiClient.GetAsync(url, cts.Token);
-                    }
-
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        url = "https://sdpondemand.manageengine.com/api/v3/users";
-                        response = await apiClient.GetAsync(url, cts.Token);
-                        if (!response.IsSuccessStatusCode)
-                        {
-                            throw new Exception($"Failed to fetch users: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
-                        }
+                        allTechnicians.Add(techDict);
                     }
                 }
-
-                string jsonResponse = await response.Content.ReadAsStringAsync(cts.Token);
-                var data = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonResponse) ?? new Dictionary<string, object>();
-                var usersElem = data.ContainsKey("users") ? (JsonElement)data["users"] : JsonDocument.Parse("[]").RootElement;
-                var currentUsers = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(usersElem.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new List<Dictionary<string, object>>();
-
-                var filteredTechs = currentUsers.Where(user => user.TryGetValue("is_technician", out var isTechObj) && bool.TryParse(isTechObj.ToString(), out bool isTech) && isTech).ToList();
-
-                foreach (var tech in filteredTechs)
-                {
-                    if (tech.TryGetValue("id", out var idObj) && seenIds.Add(idObj.ToString()))
-                    {
-                        allTechnicians.Add(tech);
-                    }
-                }
-
-                hasMoreRows = false;
-                if (data.TryGetValue("list_info", out var listInfoObj) && listInfoObj is JsonElement listInfoElem)
-                {
-                    if (listInfoElem.TryGetProperty("has_more_rows", out var hasMoreProp))
-                    {
-                        hasMoreRows = hasMoreProp.GetBoolean();
-                    }
-                    else if (listInfoElem.TryGetProperty("total_count", out var totalProp) && totalProp.TryGetInt64(out long total) && allTechnicians.Count < total)
-                    {
-                        hasMoreRows = true;
-                    }
-                }
-
-                pageNumber++;
             }
 
             _cache.Set(cacheKey, allTechnicians, TimeSpan.FromDays(30));
