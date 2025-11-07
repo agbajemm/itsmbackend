@@ -1,6 +1,8 @@
 ﻿using Azure;
 using Azure.AI.Agents.Persistent;
 using Azure.Identity;
+using documentchecker.Models;
+using documentchecker.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Caching.Memory;
 using System;
@@ -9,10 +11,12 @@ using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Web; // For URL encoding
-using System.Text.Json.Nodes;
+using System.Web;
+using System.Xml.Linq;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace documentchecker.Controllers
 {
@@ -29,7 +33,15 @@ namespace documentchecker.Controllers
         private readonly string _refreshToken;
         private readonly string _redirectUri;
 
-        public MainController(IConfiguration configuration, IHttpClientFactory httpClientFactory, IMemoryCache cache)
+        private readonly ChatService _chatService;
+        private readonly QueryHistoryService _queryHistoryService;
+
+        public MainController(
+            IConfiguration configuration,
+            IHttpClientFactory httpClientFactory,
+            IMemoryCache cache,
+            ChatService chatService,
+            QueryHistoryService queryHistoryService)
         {
             _projectEndpoint = configuration["AzureAIFoundry:ProjectEndpoint"] ?? throw new InvalidOperationException("ProjectEndpoint not configured.");
             _agentId = configuration["AzureAIFoundry:AgentId"] ?? "asst_MqwY6PBQdS9uxha6Hl1RQCJk";
@@ -39,6 +51,9 @@ namespace documentchecker.Controllers
             _clientSecret = configuration["Zoho:ClientSecret"] ?? throw new InvalidOperationException("Zoho:ClientSecret not configured.");
             _refreshToken = configuration["Zoho:RefreshToken"] ?? throw new InvalidOperationException("Zoho:RefreshToken not configured.");
             _redirectUri = configuration["Zoho:RedirectUri"] ?? throw new InvalidOperationException("Zoho:RedirectUri not configured.");
+
+            _chatService = chatService;
+            _queryHistoryService = queryHistoryService;
         }
 
         [HttpPost("agent-chat")]
@@ -49,30 +64,40 @@ namespace documentchecker.Controllers
                 return BadRequest("Message is required.");
             }
 
+            // Start conversation in DB
+            var conversationId = await _chatService.StartConversationAsync();
+            await _chatService.AddMessageAsync(conversationId, "user", request.Message);
+
             try
             {
                 var client = new PersistentAgentsClient(_projectEndpoint, new DefaultAzureCredential());
 
-                PersistentAgent agent = await client.Administration.GetAgentAsync(_agentId);
-                PersistentAgentThread thread = await client.Threads.CreateThreadAsync();
+                var agentResponse = await client.Administration.GetAgentAsync(_agentId);
+                PersistentAgent agent = agentResponse.Value;
+
+                var threadResponse = await client.Threads.CreateThreadAsync();
+                PersistentAgentThread thread = threadResponse.Value;
 
                 await client.Messages.CreateMessageAsync(thread.Id, MessageRole.User, request.Message);
 
-                ThreadRun run = await client.Runs.CreateRunAsync(
+                var runResponse = await client.Runs.CreateRunAsync(
                     thread.Id,
                     _agentId,
                     additionalInstructions: request.AdditionalInstructions
                 );
+                ThreadRun run = runResponse.Value;
 
                 do
                 {
                     await Task.Delay(500);
-                    run = await client.Runs.GetRunAsync(thread.Id, run.Id);
+                    var getRunResponse = await client.Runs.GetRunAsync(thread.Id, run.Id);
+                    run = getRunResponse.Value;
                 }
                 while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress || run.Status == RunStatus.RequiresAction);
 
                 if (run.Status == RunStatus.Failed)
                 {
+                    await _chatService.AddMessageAsync(conversationId, "system", $"Run failed: {run.LastError?.Message}");
                     return StatusCode(500, new { Error = $"Run failed: {run.LastError?.Message}" });
                 }
 
@@ -87,17 +112,31 @@ namespace documentchecker.Controllers
                             if (content is MessageTextContent textContent)
                             {
                                 agentResponses.Add(textContent.Text);
+                                await _chatService.AddMessageAsync(conversationId, "agent", textContent.Text);
                             }
                         }
                     }
                 }
 
-                return Ok(new { Responses = agentResponses });
+                return Ok(new { ConversationId = conversationId, Responses = agentResponses });
             }
             catch (Exception ex)
             {
+                await _chatService.AddMessageAsync(conversationId, "system", $"Error: {ex.Message}");
                 return StatusCode(500, new { Error = ex.Message });
             }
+        }
+
+        [HttpGet("chat-history/{conversationId}")]
+        public async Task<IActionResult> GetChatHistory(int conversationId)
+        {
+            var messages = await _chatService.GetConversationAsync(conversationId);
+            if (!messages.Any())
+            {
+                return NotFound("Conversation not found.");
+            }
+
+            return Ok(new { Messages = messages });
         }
 
         [HttpGet("test-manageengine")]
@@ -298,6 +337,19 @@ namespace documentchecker.Controllers
                 };
                 await LogDetails(logger, "Success", resultDetails);
 
+                // Log to DB
+                var queryLog = new ManageEngineQuery
+                {
+                    Subject = subject,
+                    DateFrom = dateFrom,
+                    DateTo = dateTo,
+                    Technician = technician,
+                    TotalResults = totalUnfiltered,
+                    FilteredResults = filteredRequests.Count,
+                    CacheKey = $"me-query-{subject}-{dateFrom}-{dateTo}-{technician}"
+                };
+                await _queryHistoryService.LogQueryAsync(queryLog);
+
                 return Ok(new { FilteredRequests = filteredRequests, Summary = resultDetails });
             }
             catch (TaskCanceledException ex)
@@ -339,6 +391,21 @@ namespace documentchecker.Controllers
 
                 var result = new { TopAreas = topAreas, Period = $"{months} month(s)", Timestamp = DateTime.UtcNow };
                 _cache.Set(cacheKey, result, TimeSpan.FromDays(10));
+
+                // Log query to DB
+                var queryLog = new ManageEngineQuery
+                {
+                    QueryId = Guid.NewGuid().ToString(),
+                    DateFrom = dateFrom.ToString("yyyy-MM-dd"),
+                    DateTo = dateTo.ToString("yyyy-MM-dd"),
+                    TotalResults = requests.Count,
+                    FilteredResults = topAreas.Count,
+                    ExecutedAt = DateTime.UtcNow,
+                    ExecutedBy = "TopAreas",
+                    CacheKey = $"top-areas-{months}"
+                };
+                await _queryHistoryService.LogQueryAsync(queryLog);
+
                 return Ok(result);
             }
             catch (Exception ex)
@@ -387,7 +454,52 @@ namespace documentchecker.Controllers
 
                 var result = new { InactiveTechnicians = inactive, Period = $"{months} month(s)", TotalTechnicians = allTechNames.Count, Timestamp = DateTime.UtcNow };
                 _cache.Set(cacheKey, result, TimeSpan.FromDays(10));
+
+                // Log query to DB
+                var queryLog = new ManageEngineQuery
+                {
+                    QueryId = Guid.NewGuid().ToString(),
+                    DateFrom = dateFrom.ToString("yyyy-MM-dd"),
+                    DateTo = dateTo.ToString("yyyy-MM-dd"),
+                    TotalResults = allTechnicians.Count,
+                    FilteredResults = inactive.Count,
+                    ExecutedAt = DateTime.UtcNow,
+                    ExecutedBy = "InactiveTechs",
+                    CacheKey = $"inactive-techs-{months}"
+                };
+                await _queryHistoryService.LogQueryAsync(queryLog);
+
                 return Ok(result);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Error = ex.Message });
+            }
+        }
+
+        [HttpGet("query-history")]
+        public async Task<IActionResult> GetQueryHistory([FromQuery] int? top = 50)
+        {
+            try
+            {
+                var queries = await _queryHistoryService.GetRecentQueries(top ?? 50);
+                return Ok(new
+                {
+                    Queries = queries.Select(q => new
+                    {
+                        q.QueryId,
+                        q.Subject,
+                        q.DateFrom,
+                        q.DateTo,
+                        q.Technician,
+                        q.TotalResults,
+                        q.FilteredResults,
+                        q.ExecutedAt,
+                        q.ExecutedBy,
+                        q.CacheKey
+                    }),
+                    TotalCount = queries.Count
+                });
             }
             catch (Exception ex)
             {

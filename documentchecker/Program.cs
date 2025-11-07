@@ -1,31 +1,96 @@
+﻿using Microsoft.EntityFrameworkCore;
+using Azure.Identity;
+using documentchecker.Services;
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
+// ---------------------------------------------------------------------
+// 1. Service registration (DI)
+// ---------------------------------------------------------------------
 
 builder.Services.AddControllers();
-builder.Services.AddHttpClient(); // Register IHttpClientFactory
-// Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
+
+builder.Services.AddHttpClient();               // IHttpClientFactory
+builder.Services.AddMemoryCache();              // IMemoryCache
+
+// Swagger (dev only, but harmless in prod)
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-builder.Services.AddMemoryCache();
+// ---------------------------------------------------------------------
+// 2. CORS – allow Swagger UI (localhost:xxxx) and any front‑end you need
+// ---------------------------------------------------------------------
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowSwaggerOrigins", policy =>
+    {
+        policy.WithOrigins(
+                "http://localhost:5173",   // Vite/React default
+                "https://localhost:7173",  // Swagger UI when using HTTPS
+                "http://localhost:5000")   // any other dev origin
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials();
+    });
+});
 
+// ---------------------------------------------------------------------
+// 3. EF Core – Azure SQL with Azure AD auth
+// ---------------------------------------------------------------------
+var connectionString = builder.Configuration.GetConnectionString("AzureSql")
+                       ?? throw new InvalidOperationException("Connection string 'AzureSql' not found.");
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(connectionString, sql =>
+    {
+        sql.EnableRetryOnFailure(
+            maxRetryCount: 5,
+            maxRetryDelay: TimeSpan.FromSeconds(10),
+            errorNumbersToAdd: null);
+    }));
+
+// ---------------------------------------------------------------------
+// 4. Application‑level services
+// ---------------------------------------------------------------------
+builder.Services.AddScoped<ChatService>();
+builder.Services.AddScoped<QueryHistoryService>();
+
+// ---------------------------------------------------------------------
+// 5. Build the app
+// ---------------------------------------------------------------------
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
+// ---------------------------------------------------------------------
+// 6. Middleware pipeline (order matters!)
+// ---------------------------------------------------------------------
+
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
-    app.UseSwaggerUI();
+    app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "DocumentChecker API v1"));
 }
 
+// CORS must come **before** routing / authorization
+app.UseCors("AllowSwaggerOrigins");
+
+// Force HTTPS (optional in prod, recommended)
 app.UseHttpsRedirection();
 
 app.UseAuthorization();
 
 app.MapControllers();
 
-app.Run();
+// ---------------------------------------------------------------------
+// 7. (Optional) Auto‑migrate on start – great for local dev / demos
+// ---------------------------------------------------------------------
+if (app.Environment.IsDevelopment())
+{
+    using var scope = app.Services.CreateScope();
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    db.Database.Migrate();   // creates DB + applies pending migrations
+}
 
-app.UseCors("AllowSwaggerOrigins"); // Apply CORS before routing
-app.UseHttpsRedirection(); // Optional: Enforce HTTPS in dev
+// ---------------------------------------------------------------------
+// 8. Run
+// ---------------------------------------------------------------------
+app.Run();
