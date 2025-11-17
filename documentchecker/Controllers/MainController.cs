@@ -4,9 +4,11 @@ using Azure.Identity;
 using documentchecker.Models;
 using documentchecker.Services;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore; // Ensure this is included for EF Core extensions
 using Microsoft.Extensions.Caching.Memory;
 using System;
 using System.Collections.Generic;
+using System.Dynamic; // For dynamic if needed, but we'll avoid it
 using System.Linq;
 using System.Net.Http;
 using System.Text;
@@ -18,8 +20,7 @@ using System.Threading.Tasks;
 using System.Web;
 using System.Xml.Linq;
 using static System.Runtime.InteropServices.JavaScript.JSType;
-using Microsoft.EntityFrameworkCore; // Ensure this is included for EF Core extensions
-using System.Dynamic; // For dynamic if needed, but we'll avoid it
+using OfficeOpenXml;
 
 namespace documentchecker.Controllers
 {
@@ -638,6 +639,7 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
         }
 
         // Updated MigrateHistoricalData method in MainController
+        // Updated MigrateHistoricalData method in MainController (resumable from last stored date, batches every 10 days, prioritizes 2025+)
         [HttpPost("migrate-historical")]
         public async Task<IActionResult> MigrateHistoricalData()
         {
@@ -650,7 +652,7 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
                 if (lastStoredDate.HasValue)
                 {
                     // Resume from the day after the last stored date
-                    startFromDate = lastStoredDate.Value.UtcDateTime.AddDays(1);
+                    startFromDate = lastStoredDate.Value.UtcDateTime.AddDays(0);
                     Console.WriteLine($"Resuming migration from {startFromDate:yyyy-MM-dd}");
                 }
                 else
@@ -667,11 +669,11 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
                     return Ok(new { Message = "Migration already up to date." });
                 }
 
-                // Loop month by month from startFromDate onward
+                // Loop in 10-day batches from startFromDate onward
                 var startDate = startFromDate;
                 while (startDate < currentDate)
                 {
-                    var endDate = startDate.AddMonths(1).AddDays(-1); // End of month
+                    var endDate = startDate.AddDays(10).AddSeconds(-1); // End of 10-day period (up to 23:59:59)
                     if (endDate > currentDate) endDate = currentDate;
 
                     var dateFromMs = new DateTimeOffset(startDate).ToUnixTimeMilliseconds();
@@ -690,7 +692,7 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
                         }
                     }
 
-                    startDate = endDate.AddDays(1); // Next month
+                    startDate = endDate.AddSeconds(1); // Next batch starts right after
                 }
 
                 return Ok(new { Message = "Historical migration completed or updated." });
@@ -827,6 +829,8 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
             }
         }
 
+
+
         private async Task<List<Dictionary<string, object>>> FetchRequestsForDateRange(DateTimeOffset dateFrom, DateTimeOffset dateTo)
         {
             var apiClient = _httpClientFactory.CreateClient();
@@ -859,7 +863,7 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
                     row_count = rowCount,
                     start_index = (pageNumber - 1) * rowCount,
                     sort_field = "created_time",
-                    sort_order = "desc",
+                    sort_order = "asc",
                     get_total_count = true,
                     search_criteria = searchCriteria
                 };
@@ -1042,6 +1046,91 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
             var requestsElem = data.ContainsKey("requests") ? (JsonElement)data["requests"] : JsonDocument.Parse("[]").RootElement;
             return JsonSerializer.Deserialize<List<Dictionary<string, object>>>(requestsElem.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new List<Dictionary<string, object>>();
         }
+
+        [HttpPost("import-requests")]
+        public async Task<IActionResult> ImportRequests(IFormFile file)
+        {
+            if (file == null || file.Length == 0)
+                return BadRequest("No file uploaded.");
+
+            var requests = new List<ManageEngineRequest>();
+
+            using var stream = file.OpenReadStream();
+            if (file.FileName.EndsWith(".csv", StringComparison.OrdinalIgnoreCase))
+            {
+                using var reader = new StreamReader(stream);
+                using var csv = new CsvReader(reader, CultureInfo.InvariantCulture);
+                var records = csv.GetRecords<dynamic>().ToList();
+
+                foreach (var record in records)
+                {
+                    var dict = (IDictionary<string, object>)record;
+
+                    var request = new ManageEngineRequest
+                    {
+                        Id = dict.ContainsKey("id") ? dict["id"]?.ToString() : Guid.NewGuid().ToString(),
+                        Subject = dict.ContainsKey("subject") ? dict["subject"]?.ToString() : null,
+                        TechnicianName = dict.ContainsKey("technician") ? dict["technician"]?.ToString() : null,
+                        CreatedTime = dict.ContainsKey("created_time")
+                                        ? DateTimeOffset.Parse(dict["created_time"].ToString())
+                                        : DateTimeOffset.UtcNow,
+                        JsonData = JsonSerializer.Serialize(dict)
+                    };
+
+                    requests.Add(request);
+                }
+            }
+            else if (file.FileName.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase))
+            {
+                using var package = new ExcelPackage(stream);
+                var worksheet = package.Workbook.Worksheets[0];
+                var rowCount = worksheet.Dimension.Rows;
+                var colCount = worksheet.Dimension.Columns;
+
+                var headers = new List<string>();
+                for (int col = 1; col <= colCount; col++)
+                    headers.Add(worksheet.Cells[1, col].Text);
+
+                for (int row = 2; row <= rowCount; row++)
+                {
+                    var dict = new Dictionary<string, object>();
+                    for (int col = 1; col <= colCount; col++)
+                        dict[headers[col - 1]] = worksheet.Cells[row, col].Text;
+
+                    var request = new ManageEngineRequest
+                    {
+                        Id = dict.ContainsKey("id") ? dict["id"]?.ToString() : Guid.NewGuid().ToString(),
+                        Subject = dict.ContainsKey("subject") ? dict["subject"]?.ToString() : null,
+                        TechnicianName = dict.ContainsKey("technician") ? dict["technician"]?.ToString() : null,
+                        CreatedTime = dict.ContainsKey("created_time")
+                                        ? DateTimeOffset.Parse(dict["created_time"].ToString())
+                                        : DateTimeOffset.UtcNow,
+                        JsonData = JsonSerializer.Serialize(dict)
+                    };
+
+                    requests.Add(request);
+                }
+            }
+            else
+            {
+                return BadRequest("Unsupported file format. Please upload CSV or XLSX.");
+            }
+
+            // Avoid duplicates
+            var existingIds = await _dbContext.ManageEngineRequests
+                .Select(r => r.Id)
+                .ToListAsync();
+
+            var newRequests = requests
+                .Where(r => !existingIds.Contains(r.Id))
+                .ToList();
+
+            await _dbContext.ManageEngineRequests.AddRangeAsync(newRequests);
+            await _dbContext.SaveChangesAsync();
+
+            return Ok(new { Imported = newRequests.Count, Skipped = requests.Count - newRequests.Count });
+        }
+
     }
 
     // Helper classes
