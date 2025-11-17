@@ -1,6 +1,4 @@
 ﻿using Azure;
-using Azure.AI.Agents.Persistent;
-using Azure.Identity;
 using documentchecker.Models;
 using documentchecker.Services;
 using Microsoft.AspNetCore.Mvc;
@@ -13,9 +11,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
-using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
 using CsvHelper;
@@ -27,8 +23,6 @@ namespace documentchecker.Controllers
     [Route("api/[controller]")]
     public class MainController : ControllerBase
     {
-        private readonly string _projectEndpoint;
-        private readonly string _agentId;
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly IMemoryCache _cache;
         private readonly ChatService _chatService;
@@ -37,7 +31,10 @@ namespace documentchecker.Controllers
         private readonly string _meAiDeploymentName;
         private readonly string _meAiApiVersion;
         private readonly string _meAiApiKey;
-        private readonly RequestStorageService _requestStorageService;
+        private readonly string _zohoClientId;
+        private readonly string _zohoClientSecret;
+        private readonly string _zohoRefreshToken;
+        private readonly string _zohoRedirectUri;
         private readonly AppDbContext _dbContext;
 
         public MainController(
@@ -46,11 +43,8 @@ namespace documentchecker.Controllers
             IMemoryCache cache,
             ChatService chatService,
             QueryHistoryService queryHistoryService,
-            RequestStorageService requestStorageService,
             AppDbContext dbContext)
         {
-            _projectEndpoint = configuration["AzureAIFoundry:ProjectEndpoint"] ?? throw new InvalidOperationException("ProjectEndpoint not configured.");
-            _agentId = configuration["AzureAIFoundry:AgentId"] ?? "asst_MqwY6PBQdS9uxha6Hl1RQCJk";
             _httpClientFactory = httpClientFactory;
             _cache = cache;
             _chatService = chatService;
@@ -59,12 +53,15 @@ namespace documentchecker.Controllers
             _meAiDeploymentName = configuration["ManageEngineAI:DeploymentName"] ?? throw new InvalidOperationException("ManageEngineAI:DeploymentName not configured.");
             _meAiApiVersion = configuration["ManageEngineAI:ApiVersion"] ?? throw new InvalidOperationException("ManageEngineAI:ApiVersion not configured.");
             _meAiApiKey = configuration["ManageEngineAI:ApiKey"] ?? throw new InvalidOperationException("ManageEngineAI:ApiKey not configured.");
-            _requestStorageService = requestStorageService;
+            _zohoClientId = configuration["Zoho:ClientId"] ?? throw new InvalidOperationException("Zoho:ClientId not configured.");
+            _zohoClientSecret = configuration["Zoho:ClientSecret"] ?? throw new InvalidOperationException("Zoho:ClientSecret not configured.");
+            _zohoRefreshToken = configuration["Zoho:RefreshToken"] ?? throw new InvalidOperationException("Zoho:RefreshToken not configured.");
+            _zohoRedirectUri = configuration["Zoho:RedirectUri"] ?? throw new InvalidOperationException("Zoho:RedirectUri not configured.");
             _dbContext = dbContext;
         }
 
-        // Sync endpoint to fetch and store recent records from ManageEngine
-        [HttpPost("sync-recent-records")]
+        // Sync endpoint - fetches most recent records from ManageEngine and stores them
+        [HttpPost("sync")]
         public async Task<IActionResult> SyncRecentRecords()
         {
             try
@@ -74,12 +71,12 @@ namespace documentchecker.Controllers
                     .Select(r => r.CreatedTime)
                     .FirstOrDefaultAsync();
 
-                var dateFrom = lastStoredDate != default ? lastStoredDate : new DateTimeOffset(2025, 1, 1, 0, 0, 0, TimeSpan.Zero);
+                var dateFrom = lastStoredDate != default ? lastStoredDate.AddHours(-1) : new DateTimeOffset(2025, 1, 1, 0, 0, 0, TimeSpan.Zero);
                 var dateTo = DateTimeOffset.UtcNow;
 
-                Console.WriteLine($"Syncing records from {dateFrom:yyyy-MM-dd HH:mm:ss} to {dateTo:yyyy-MM-dd HH:mm:ss}");
+                Console.WriteLine($"[SYNC] Fetching records from {dateFrom:yyyy-MM-dd HH:mm:ss} to {dateTo:yyyy-MM-dd HH:mm:ss}");
 
-                var requests = await FetchRequestsFromManageEngine(dateFrom, dateTo);
+                var requests = await FetchFromManageEngine(dateFrom, dateTo);
 
                 int newCount = 0;
                 var existingIds = await _dbContext.ManageEngineRequests
@@ -88,590 +85,146 @@ namespace documentchecker.Controllers
 
                 foreach (var req in requests)
                 {
-                    var requestId = req["id"].ToString();
-                    if (!existingIds.Contains(requestId))
+                    var requestId = req["id"]?.ToString();
+                    if (!string.IsNullOrEmpty(requestId) && !existingIds.Contains(requestId))
                     {
-                        var managedRequest = new ManageEngineRequest
+                        var meRequest = new ManageEngineRequest
                         {
                             Id = requestId,
-                            Subject = req.TryGetValue("subject", out var subj) ? subj?.ToString() : null,
+                            Subject = ExtractField(req, "subject"),
                             TechnicianName = ExtractTechnicianName(req),
                             CreatedTime = ExtractCreatedTime(req),
                             JsonData = JsonSerializer.Serialize(req)
                         };
 
-                        _dbContext.ManageEngineRequests.Add(managedRequest);
+                        _dbContext.ManageEngineRequests.Add(meRequest);
                         newCount++;
                     }
                 }
 
-                await _dbContext.SaveChangesAsync();
+                if (newCount > 0)
+                {
+                    await _dbContext.SaveChangesAsync();
+                    Console.WriteLine($"[SYNC] Stored {newCount} new records");
+                }
 
-                return Ok(new { Message = "Sync completed", NewRecords = newCount, TotalFetched = requests.Count });
+                return Ok(new { Success = true, NewRecords = newCount, TotalFetched = requests.Count, LastSyncTime = DateTime.UtcNow });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, new { Error = ex.Message });
+                Console.WriteLine($"[SYNC] Error: {ex.Message}");
+                return StatusCode(500, new { Success = false, Error = ex.Message });
             }
         }
 
-        // Main AI query endpoint - queries database based on AI-interpreted filters
-        [HttpPost("ai-query")]
-        public async Task<IActionResult> AiQuery([FromBody] AiQueryRequest request)
+        // Main AI-powered query endpoint - understands natural language perfectly
+        [HttpPost("query")]
+        public async Task<IActionResult> Query([FromBody] QueryRequest request)
         {
             if (string.IsNullOrEmpty(request?.Query))
-                return BadRequest("Query is required.");
+                return BadRequest(new { Success = false, Error = "Query is required." });
 
             try
             {
-                // First, try to detect specialized query types
-                var queryType = await DetectQueryTypeFromAI(request.Query);
+                Console.WriteLine($"[QUERY] User query: {request.Query}");
 
-                if (queryType.Type == "top-request-areas" && queryType.Months.HasValue)
+                // Use AI to understand the query and extract intent + parameters
+                var queryIntent = await ParseQueryWithAI(request.Query);
+                Console.WriteLine($"[QUERY] Parsed intent: Type={queryIntent.Type}, Params={JsonSerializer.Serialize(queryIntent.Parameters)}");
+
+                // Route to appropriate handler based on intent
+                return queryIntent.Type switch
                 {
-                    var dateFrom = DateTime.UtcNow.AddMonths(-queryType.Months.Value);
-                    var dateTo = DateTime.UtcNow;
-                    return await GetTopRequestAreasDetailed(dateFrom, dateTo);
-                }
-
-                if (queryType.Type == "inactive-technicians" && queryType.Months.HasValue)
-                    return await GetTechniciansWithoutRequests(queryType.Months.Value);
-
-                if (queryType.Type == "requests-influx" && queryType.Months.HasValue)
-                {
-                    var dateFrom = DateTime.UtcNow.AddMonths(-queryType.Months.Value);
-                    var dateTo = DateTime.UtcNow;
-                    var hour = (queryType as dynamic)?.Hour;
-                    return await GetRequestsInfluxByHour(dateFrom, dateTo, hour);
-                }
-
-                // For standard queries, extract filters and query database
-                var filters = await GetFiltersFromAI(request.Query);
-                return await QueryDatabase(filters);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { Error = $"AI query processing failed: {ex.Message}" });
-            }
-        }
-
-        // Query database with filters
-        [HttpPost("filter-query")]
-        public async Task<IActionResult> QueryDatabase([FromBody] Filters filters)
-        {
-            try
-            {
-                var query = _dbContext.ManageEngineRequests.AsQueryable();
-
-                if (!string.IsNullOrEmpty(filters.Subject))
-                    query = query.Where(r => r.Subject.Contains(filters.Subject));
-
-                if (!string.IsNullOrEmpty(filters.Technician))
-                    query = query.Where(r => r.TechnicianName.Contains(filters.Technician));
-
-                if (DateTime.TryParse(filters.DateFrom, out var dateFromParsed) &&
-                    DateTime.TryParse(filters.DateTo, out var dateToParsed))
-                {
-                    var dateFrom = new DateTimeOffset(dateFromParsed);
-                    var dateTo = new DateTimeOffset(dateToParsed);
-                    query = query.Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo);
-                }
-
-                var results = await query
-                    .OrderByDescending(r => r.CreatedTime)
-                    .Select(r => new
-                    {
-                        r.Id,
-                        r.Subject,
-                        r.TechnicianName,
-                        r.CreatedTime
-                    })
-                    .ToListAsync();
-
-                return Ok(new
-                {
-                    FilteredRequests = results,
-                    Summary = new
-                    {
-                        TotalResults = results.Count,
-                        AppliedFilters = new { filters.Subject, filters.Technician, filters.DateFrom, filters.DateTo },
-                        Timestamp = DateTime.UtcNow
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { Error = ex.Message });
-            }
-        }
-
-        // Advanced query endpoint for custom AI-generated queries
-        [HttpPost("advanced-query")]
-        public async Task<IActionResult> AdvancedQuery([FromBody] AdvancedQueryRequest request)
-        {
-            if (string.IsNullOrEmpty(request?.Query))
-                return BadRequest("Query is required.");
-
-            try
-            {
-                // Let AI generate a dynamic LINQ-like query description
-                var queryDescription = await GenerateCustomQuery(request.Query);
-
-                // Execute predefined query types based on AI description
-                return queryDescription.Type switch
-                {
-                    "requests-by-technician" => await GetRequestsByTechnician(queryDescription.Technician),
-                    "requests-by-subject" => await GetRequestsBySubject(queryDescription.Subject),
-                    "requests-in-date-range" => await GetRequestsInDateRange(queryDescription.DateFrom, queryDescription.DateTo),
-                    "technician-workload" => await GetTechnicianWorkload(queryDescription.DateFrom, queryDescription.DateTo),
-                    _ => await QueryDatabase(new Filters(queryDescription.Subject, queryDescription.Technician, queryDescription.DateFrom, queryDescription.DateTo))
+                    "top-request-areas" => await HandleTopRequestAreas(queryIntent.Parameters),
+                    "request-influx" => await HandleRequestInflux(queryIntent.Parameters),
+                    "inactive-technicians" => await HandleInactiveTechnicians(queryIntent.Parameters),
+                    "technician-workload" => await HandleTechnicianWorkload(queryIntent.Parameters),
+                    "requests-by-subject" => await HandleRequestsBySubject(queryIntent.Parameters),
+                    "requests-by-technician" => await HandleRequestsByTechnician(queryIntent.Parameters),
+                    "general-search" => await HandleGeneralSearch(queryIntent.Parameters),
+                    _ => BadRequest(new { Success = false, Error = "Unable to understand query type" })
                 };
             }
             catch (Exception ex)
             {
-                return StatusCode(500, new { Error = ex.Message });
+                Console.WriteLine($"[QUERY] Error: {ex.Message}");
+                return StatusCode(500, new { Success = false, Error = ex.Message });
             }
         }
 
-        // Specialized endpoint: Get top request areas
-        [HttpGet("top-request-areas")]
-        public async Task<IActionResult> GetTopRequestAreas([FromQuery] int months = 1)
-        {
-            if (months < 1 || months > 12)
-                return BadRequest("Months must be between 1 and 12.");
-
-            try
-            {
-                var dateTo = DateTime.UtcNow;
-                var dateFrom = dateTo.AddMonths(-months);
-
-                var topAreas = await _dbContext.ManageEngineRequests
-                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.Subject))
-                    .GroupBy(r => r.Subject)
-                    .Select(g => new { Subject = g.Key, Count = g.Count() })
-                    .OrderByDescending(x => x.Count)
-                    .Take(10)
-                    .ToListAsync();
-
-                return Ok(new { TopAreas = topAreas, Period = $"{months} month(s)", Timestamp = DateTime.UtcNow });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { Error = ex.Message });
-            }
-        }
-
-        // Specialized endpoint: Get inactive technicians
-        [HttpGet("inactive-technicians")]
-        public async Task<IActionResult> GetInactiveTechnicians([FromQuery] int months = 1)
-        {
-            if (months < 1 || months > 12)
-                return BadRequest("Months must be between 1 and 12.");
-
-            try
-            {
-                var dateFrom = DateTime.UtcNow.AddMonths(-months);
-                var dateTo = DateTime.UtcNow;
-
-                var allTechnicians = await _dbContext.ManageEngineRequests
-                    .Where(r => !string.IsNullOrEmpty(r.TechnicianName))
-                    .Select(r => r.TechnicianName)
-                    .Distinct()
-                    .ToListAsync();
-
-                var activeTechnicians = await _dbContext.ManageEngineRequests
-                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.TechnicianName))
-                    .Select(r => r.TechnicianName)
-                    .Distinct()
-                    .ToListAsync();
-
-                var inactive = allTechnicians.Except(activeTechnicians).ToList();
-
-                return Ok(new { InactiveTechnicians = inactive, Period = $"{months} month(s)", TotalTechnicians = allTechnicians.Count });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { Error = ex.Message });
-            }
-        }
-
-        // Get distinct technicians
-        [HttpGet("technicians")]
-        public async Task<IActionResult> GetDistinctTechnicians()
-        {
-            try
-            {
-                var technicians = await _dbContext.ManageEngineRequests
-                    .Where(r => !string.IsNullOrEmpty(r.TechnicianName))
-                    .Select(r => r.TechnicianName)
-                    .Distinct()
-                    .OrderBy(t => t)
-                    .ToListAsync();
-
-                return Ok(technicians);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { Error = ex.Message });
-            }
-        }
-
-        // 1. Influx of requests within a certain hour
-        [HttpGet("requests-influx-by-hour")]
-        public async Task<IActionResult> GetRequestsInfluxByHour([FromQuery] DateTime dateFrom, [FromQuery] DateTime dateTo, [FromQuery] int? hour = null)
-        {
-            try
-            {
-                var query = _dbContext.ManageEngineRequests
-                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo);
-
-                if (hour.HasValue && hour.Value >= 0 && hour.Value < 24)
-                    query = query.Where(r => r.CreatedTime.Hour == hour.Value);
-
-                var hourlyCounts = await query
-                    .GroupBy(r => new { r.CreatedTime.Date, r.CreatedTime.Hour })
-                    .Select(g => new
-                    {
-                        Date = g.Key.Date,
-                        Hour = g.Key.Hour,
-                        HourRange = $"{g.Key.Hour:00}:00-{g.Key.Hour:00}:59",
-                        Count = g.Count(),
-                        RequestIds = g.Select(r => r.Id).ToList()
-                    })
-                    .OrderBy(x => x.Date)
-                    .ThenBy(x => x.Hour)
-                    .ToListAsync();
-
-                var peakHour = hourlyCounts.OrderByDescending(h => h.Count).FirstOrDefault();
-
-                return Ok(new
-                {
-                    HourlyBreakdown = hourlyCounts,
-                    Period = $"{dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}",
-                    SpecificHour = hour.HasValue ? $"{hour:00}:00" : "All hours",
-                    TotalRequests = hourlyCounts.Sum(h => h.Count),
-                    PeakHour = peakHour?.HourRange,
-                    PeakHourCount = peakHour?.Count ?? 0,
-                    Timestamp = DateTime.UtcNow
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { Error = ex.Message });
-            }
-        }
-
-        // 2. Top Request Areas (Subject Areas)
-        [HttpGet("top-request-areas-detailed")]
-        public async Task<IActionResult> GetTopRequestAreasDetailed([FromQuery] DateTime? dateFrom = null, [FromQuery] DateTime? dateTo = null, [FromQuery] int topN = 10)
-        {
-            try
-            {
-                var from = dateFrom ?? DateTime.UtcNow.AddMonths(-1);
-                var to = dateTo ?? DateTime.UtcNow;
-
-                var topAreas = await _dbContext.ManageEngineRequests
-                    .Where(r => r.CreatedTime >= from && r.CreatedTime <= to && !string.IsNullOrEmpty(r.Subject))
-                    .GroupBy(r => r.Subject)
-                    .Select(g => new
-                    {
-                        Subject = g.Key,
-                        Count = g.Count(),
-                        Percentage = ((double)g.Count() / _dbContext.ManageEngineRequests.Count(r => r.CreatedTime >= from && r.CreatedTime <= to)) * 100,
-                        RequestIds = g.Select(r => r.Id).ToList(),
-                        LatestRequest = g.OrderByDescending(r => r.CreatedTime).FirstOrDefault().CreatedTime,
-                        EarliestRequest = g.OrderBy(r => r.CreatedTime).FirstOrDefault().CreatedTime
-                    })
-                    .OrderByDescending(x => x.Count)
-                    .Take(topN)
-                    .ToListAsync();
-
-                var totalRequests = await _dbContext.ManageEngineRequests
-                    .Where(r => r.CreatedTime >= from && r.CreatedTime <= to)
-                    .CountAsync();
-
-                var topAreasWithDetails = topAreas.Select(area => new
-                {
-                    area.Subject,
-                    area.Count,
-                    Percentage = Math.Round(area.Percentage, 2),
-                    area.RequestIds,
-                    area.LatestRequest,
-                    area.EarliestRequest
-                }).ToList();
-
-                return Ok(new
-                {
-                    TopAreas = topAreasWithDetails,
-                    Period = $"{from:yyyy-MM-dd} to {to:yyyy-MM-dd}",
-                    TotalRequests = totalRequests,
-                    UniqueSubjects = topAreasWithDetails.Count,
-                    TopArea = topAreasWithDetails.FirstOrDefault()?.Subject,
-                    Timestamp = DateTime.UtcNow
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { Error = ex.Message });
-            }
-        }
-
-        // 3. Technicians without any request for a specified duration
-        [HttpGet("technicians-without-requests")]
-        public async Task<IActionResult> GetTechniciansWithoutRequests([FromQuery] int monthsDuration = 1)
-        {
-            if (monthsDuration < 1 || monthsDuration > 12)
-                return BadRequest("Month duration must be between 1 and 12.");
-
-            try
-            {
-                var cutoffDate = DateTime.UtcNow.AddMonths(-monthsDuration);
-
-                // Get all technicians that ever existed
-                var allTechnicians = await _dbContext.ManageEngineRequests
-                    .Where(r => !string.IsNullOrEmpty(r.TechnicianName))
-                    .Select(r => r.TechnicianName)
-                    .Distinct()
-                    .ToListAsync();
-
-                // Get technicians active in the specified duration
-                var activeTechnicians = await _dbContext.ManageEngineRequests
-                    .Where(r => r.CreatedTime >= cutoffDate && r.CreatedTime <= DateTime.UtcNow && !string.IsNullOrEmpty(r.TechnicianName))
-                    .Select(r => r.TechnicianName)
-                    .Distinct()
-                    .ToListAsync();
-
-                // Inactive = all - active in duration
-                var inactiveTechnicians = allTechnicians.Except(activeTechnicians).ToList();
-
-                // Get details for inactive technicians
-                var inactiveDetails = new List<object>();
-
-                foreach (var techName in inactiveTechnicians)
-                {
-                    var lastRequestDate = await _dbContext.ManageEngineRequests
-                        .Where(r => r.TechnicianName == techName)
-                        .OrderByDescending(r => r.CreatedTime)
-                        .Select(r => r.CreatedTime)
-                        .FirstOrDefaultAsync();
-
-                    var totalRequests = await _dbContext.ManageEngineRequests
-                        .Where(r => r.TechnicianName == techName)
-                        .CountAsync();
-
-                    inactiveDetails.Add(new
-                    {
-                        TechnicianName = techName,
-                        LastRequestDate = lastRequestDate,
-                        DaysSinceLastRequest = (DateTime.UtcNow - lastRequestDate.DateTime).Days,
-                        TotalRequestsAllTime = totalRequests
-                    });
-                }
-
-                var sortedInactive = inactiveDetails
-                    .Cast<dynamic>()
-                    .OrderByDescending(t => t.DaysSinceLastRequest)
-                    .ToList();
-
-                return Ok(new
-                {
-                    InactiveTechnicians = sortedInactive,
-                    DurationMonths = monthsDuration,
-                    CutoffDate = cutoffDate.ToString("yyyy-MM-dd"),
-                    TotalTechnicians = allTechnicians.Count,
-                    InactiveCount = inactiveTechnicians.Count,
-                    ActiveCount = activeTechnicians.Count,
-                    InactivityPercentage = Math.Round(((double)inactiveTechnicians.Count / allTechnicians.Count) * 100, 2),
-                    Timestamp = DateTime.UtcNow
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { Error = ex.Message });
-            }
-        }
-
-        // Get requests with full JSON data
-        [HttpGet("requests-with-data")]
-        public async Task<IActionResult> GetRequestsWithData([FromQuery] string? subject = null, [FromQuery] string? technician = null, [FromQuery] DateTime? dateFrom = null, [FromQuery] DateTime? dateTo = null, [FromQuery] int take = 100)
-        {
-            try
-            {
-                var query = _dbContext.ManageEngineRequests.AsQueryable();
-
-                if (!string.IsNullOrEmpty(subject))
-                    query = query.Where(r => r.Subject.Contains(subject));
-
-                if (!string.IsNullOrEmpty(technician))
-                    query = query.Where(r => r.TechnicianName.Contains(technician));
-
-                if (dateFrom.HasValue)
-                    query = query.Where(r => r.CreatedTime >= dateFrom.Value);
-
-                if (dateTo.HasValue)
-                    query = query.Where(r => r.CreatedTime <= dateTo.Value);
-
-                var requests = await query
-                    .OrderByDescending(r => r.CreatedTime)
-                    .Take(take)
-                    .Select(r => new
-                    {
-                        r.Id,
-                        r.Subject,
-                        r.TechnicianName,
-                        r.CreatedTime,
-                        JsonData = JsonDocument.Parse(r.JsonData, new JsonDocumentOptions()).RootElement
-                    })
-                    .ToListAsync();
-
-                return Ok(new
-                {
-                    Requests = requests,
-                    FilterApplied = new { subject, technician, dateFrom, dateTo },
-                    Count = requests.Count,
-                    Timestamp = DateTime.UtcNow
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { Error = ex.Message });
-            }
-        }
-
-        // Helper endpoints for advanced queries
-        private async Task<IActionResult> GetRequestsByTechnician(string technician)
-        {
-            var requests = await _dbContext.ManageEngineRequests
-                .Where(r => r.TechnicianName.Contains(technician))
-                .OrderByDescending(r => r.CreatedTime)
-                .Take(100)
-                .ToListAsync();
-
-            return Ok(new { Requests = requests, Technician = technician, Count = requests.Count });
-        }
-
-        private async Task<IActionResult> GetRequestsBySubject(string subject)
-        {
-            var requests = await _dbContext.ManageEngineRequests
-                .Where(r => r.Subject.Contains(subject))
-                .OrderByDescending(r => r.CreatedTime)
-                .Take(100)
-                .ToListAsync();
-
-            return Ok(new { Requests = requests, Subject = subject, Count = requests.Count });
-        }
-
-        private async Task<IActionResult> GetRequestsInDateRange(string dateFrom, string dateTo)
-        {
-            if (!DateTime.TryParse(dateFrom, out var from) || !DateTime.TryParse(dateTo, out var to))
-                return BadRequest("Invalid date format.");
-
-            var requests = await _dbContext.ManageEngineRequests
-                .Where(r => r.CreatedTime >= from && r.CreatedTime <= to)
-                .OrderByDescending(r => r.CreatedTime)
-                .Take(500)
-                .ToListAsync();
-
-            return Ok(new { Requests = requests, DateRange = $"{dateFrom} to {dateTo}", Count = requests.Count });
-        }
-
-        private async Task<IActionResult> GetTechnicianWorkload(string dateFrom, string dateTo)
-        {
-            if (!DateTime.TryParse(dateFrom, out var from) || !DateTime.TryParse(dateTo, out var to))
-                return BadRequest("Invalid date format.");
-
-            var workload = await _dbContext.ManageEngineRequests
-                .Where(r => r.CreatedTime >= from && r.CreatedTime <= to && !string.IsNullOrEmpty(r.TechnicianName))
-                .GroupBy(r => r.TechnicianName)
-                .Select(g => new { Technician = g.Key, RequestCount = g.Count() })
-                .OrderByDescending(x => x.RequestCount)
-                .ToListAsync();
-
-            return Ok(new { Workload = workload, Period = $"{dateFrom} to {dateTo}" });
-        }
-
-        // AI detection for query type
-        private async Task<QueryType> DetectQueryTypeFromAI(string userQuery)
+        // AI-powered query parser - extracts intent and parameters from natural language
+        private async Task<QueryIntent> ParseQueryWithAI(string userQuery)
         {
             var apiClient = _httpClientFactory.CreateClient();
             var fullUrl = $"{_meAiEndpoint}openai/deployments/{_meAiDeploymentName}/chat/completions?api-version={_meAiApiVersion}";
 
-            var detectionPrompt = $@"Analyze this query and determine its type. Return ONLY a JSON object.
+            string currentDate = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
 
-If the query is asking for:
-1. Top/most common request areas/categories/subjects - return {{""type"": ""top-request-areas"", ""months"": <number>}}
-2. Inactive technicians / technicians without requests - return {{""type"": ""inactive-technicians"", ""months"": <number>}}
-3. Influx of requests within a certain hour / requests per hour - return {{""type"": ""requests-influx"", ""hour"": <number or null>, ""months"": <number>}}
-4. Otherwise - return {{""type"": ""standard"", ""months"": null}}
+            var systemPrompt = $@"You are a query parser for a support ticket system. Current date/time: {currentDate}
 
-Extract the number of months from relative time expressions (default = 1).
-Extract the hour (0-23) if a specific hour is mentioned, otherwise null.
-Output ONLY the JSON object, no other text.
+Parse the user's query and return ONLY a JSON object with this structure:
+{{
+  ""type"": ""<query_type>"",
+  ""parameters"": {{...extracted parameters...}}
+}}
+
+Query types:
+1. ""top-request-areas"" - User wants to see most common request subjects/categories
+   Parameters: dateFrom (yyyy-MM-dd), dateTo (yyyy-MM-dd)
+   
+2. ""request-influx"" - User wants to see when requests peaked (hour-by-hour analysis)
+   Parameters: dateFrom (yyyy-MM-dd), dateTo (yyyy-MM-dd), groupBy (""hour"" or ""day"")
+   
+3. ""inactive-technicians"" - User wants to see technicians with no activity
+   Parameters: dateFrom (yyyy-MM-dd), dateTo (yyyy-MM-dd)
+   
+4. ""technician-workload"" - User wants to see how much work each technician has
+   Parameters: dateFrom (yyyy-MM-dd), dateTo (yyyy-MM-dd)
+   
+5. ""requests-by-subject"" - User wants requests about a specific topic
+   Parameters: subject (string), dateFrom (yyyy-MM-dd), dateTo (yyyy-MM-dd)
+   
+6. ""requests-by-technician"" - User wants requests handled by a specific technician
+   Parameters: technician (string), dateFrom (yyyy-MM-dd), dateTo (yyyy-MM-dd)
+   
+7. ""general-search"" - User wants to search with custom filters
+   Parameters: subject (string), technician (string), dateFrom (yyyy-MM-dd), dateTo (yyyy-MM-dd)
+
+Date interpretation (from current date {currentDate}):
+- ""today"" = {DateTime.UtcNow:yyyy-MM-dd} to {DateTime.UtcNow:yyyy-MM-dd}
+- ""yesterday"" = {DateTime.UtcNow.AddDays(-1):yyyy-MM-dd} to {DateTime.UtcNow.AddDays(-1):yyyy-MM-dd}
+- ""past 2 hours"" = 2 hours ago to now
+- ""past 24 hours"" or ""last day"" = 24 hours ago to now
+- ""past week"" or ""last 7 days"" = 7 days ago to now
+- ""past 2 weeks"" = 14 days ago to now
+- ""past month"" or ""last 30 days"" = 30 days ago to now
+- ""past 3 months"" = 90 days ago to now
+- ""past year"" = 365 days ago to now
 
 Examples:
-- ""Show me top request areas for last 3 months"" -> {{""type"": ""top-request-areas"", ""months"": 3}}
-- ""Which technicians have been inactive for 6 months?"" -> {{""type"": ""inactive-technicians"", ""months"": 6}}
-- ""How many requests came in during hour 14 last month?"" -> {{""type"": ""requests-influx"", ""hour"": 14, ""months"": 1}}
-- ""Show password reset tickets from January"" -> {{""type"": ""standard"", ""months"": null}}
+Query: ""Show me top request areas for yesterday""
+Output: {{""type"": ""top-request-areas"", ""parameters"": {{""dateFrom"": ""{DateTime.UtcNow.AddDays(-1):yyyy-MM-dd}"", ""dateTo"": ""{DateTime.UtcNow.AddDays(-1):yyyy-MM-dd}""}}}}
 
-User query: {userQuery}";
+Query: ""What hour did we get the most requests today?""
+Output: {{""type"": ""request-influx"", ""parameters"": {{""dateFrom"": ""{DateTime.UtcNow:yyyy-MM-dd}"", ""dateTo"": ""{DateTime.UtcNow:yyyy-MM-dd}"", ""groupBy"": ""hour""}}}}
 
-            var requestBody = new
-            {
-                messages = new[] { new { role = "user", content = detectionPrompt } },
-                max_tokens = 100,
-                temperature = 0.1
-            };
+Query: ""Which technicians have not treated any request in 2 weeks?""
+Output: {{""type"": ""inactive-technicians"", ""parameters"": {{""dateFrom"": ""{DateTime.UtcNow.AddDays(-14):yyyy-MM-dd}"", ""dateTo"": ""{DateTime.UtcNow:yyyy-MM-dd}""}}}}
 
-            var json = JsonSerializer.Serialize(requestBody);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
-            apiClient.DefaultRequestHeaders.Add("api-key", _meAiApiKey);
+Query: ""Password reset requests from the past 2 hours""
+Output: {{""type"": ""requests-by-subject"", ""parameters"": {{""subject"": ""password reset"", ""dateFrom"": ""{DateTime.UtcNow.AddHours(-2):yyyy-MM-dd HH:mm:ss}"", ""dateTo"": ""{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}""}}}}
 
-            var response = await apiClient.PostAsync(fullUrl, content);
-
-            if (!response.IsSuccessStatusCode)
-                return new QueryType { Type = "standard", Months = null };
-
-            var responseJson = await response.Content.ReadAsStringAsync();
-            var aiResponse = JsonSerializer.Deserialize<AiResponse>(responseJson);
-
-            if (aiResponse?.Choices == null || aiResponse.Choices.Count == 0)
-                return new QueryType { Type = "standard", Months = null };
-
-            var outputContent = aiResponse.Choices[0].Message.Content;
-            var queryType = JsonSerializer.Deserialize<QueryType>(outputContent, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-                ?? new QueryType { Type = "standard", Months = null };
-
-            return queryType;
-        }
-
-        // Extract filters from natural language
-        private async Task<Filters> GetFiltersFromAI(string userQuery)
-        {
-            var apiClient = _httpClientFactory.CreateClient();
-            var fullUrl = $"{_meAiEndpoint}openai/deployments/{_meAiDeploymentName}/chat/completions?api-version={_meAiApiVersion}";
-            string currentDate = DateTime.UtcNow.ToString("yyyy-MM-dd");
-
-            var systemPrompt = $@"Convert natural language queries into structured filters.
-Current date: {currentDate}
-
-Output JSON with keys: subject, technician, dateFrom, dateTo (all nullable strings in yyyy-MM-dd format).
-
-Example:
-Query: password reset tickets from John last month
-Output: {{""subject"": ""password reset"", ""technician"": ""John"", ""dateFrom"": ""{DateTime.Parse(currentDate).AddMonths(-1):yyyy-MM-dd}"", ""dateTo"": ""{currentDate}""}}";
-
-            var userPrompt = $"Query: {userQuery}";
+Return ONLY the JSON object, no other text.";
 
             var requestBody = new
             {
                 messages = new[]
                 {
                     new { role = "system", content = systemPrompt },
-                    new { role = "user", content = userPrompt }
+                    new { role = "user", content = userQuery }
                 },
-                max_tokens = 200,
-                temperature = 0.2
+                max_tokens = 300,
+                temperature = 0.3
             };
 
             var json = JsonSerializer.Serialize(requestBody);
@@ -681,61 +234,285 @@ Output: {{""subject"": ""password reset"", ""technician"": ""John"", ""dateFrom"
             var response = await apiClient.PostAsync(fullUrl, content);
 
             if (!response.IsSuccessStatusCode)
-                throw new Exception($"AI API request failed: {response.StatusCode}");
+                throw new Exception($"AI API failed: {response.StatusCode}");
 
             var responseJson = await response.Content.ReadAsStringAsync();
             var aiResponse = JsonSerializer.Deserialize<AiResponse>(responseJson);
 
             if (aiResponse?.Choices == null || aiResponse.Choices.Count == 0)
-                throw new Exception("Invalid AI response format.");
+                throw new Exception("Invalid AI response");
 
             var outputContent = aiResponse.Choices[0].Message.Content;
-            var filters = JsonSerializer.Deserialize<Filters>(outputContent, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-                ?? new Filters(null, null, null, null);
+            Console.WriteLine($"[AI] Raw output: {outputContent}");
 
-            return filters;
+            var intent = JsonSerializer.Deserialize<QueryIntent>(outputContent, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                ?? throw new Exception("Failed to parse query intent");
+
+            return intent;
         }
 
-        // Generate custom query description
-        private async Task<QueryDescription> GenerateCustomQuery(string userQuery)
+        // Handler: Top request areas
+        private async Task<IActionResult> HandleTopRequestAreas(Dictionary<string, object> parameters)
         {
-            var apiClient = _httpClientFactory.CreateClient();
-            var fullUrl = $"{_meAiEndpoint}openai/deployments/{_meAiDeploymentName}/chat/completions?api-version={_meAiApiVersion}";
+            var (dateFrom, dateTo) = ExtractDateRange(parameters);
 
-            var prompt = $@"Analyze this query and return a JSON description.
-Return type as one of: requests-by-technician, requests-by-subject, requests-in-date-range, technician-workload, or standard.
-Include subject, technician, dateFrom, dateTo fields.
+            var topAreas = await _dbContext.ManageEngineRequests
+                .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.Subject))
+                .GroupBy(r => r.Subject)
+                .Select(g => new { Subject = g.Key, Count = g.Count() })
+                .OrderByDescending(x => x.Count)
+                .Take(15)
+                .ToListAsync();
 
-Query: {userQuery}";
-
-            var requestBody = new
+            return Ok(new
             {
-                messages = new[] { new { role = "user", content = prompt } },
-                max_tokens = 150,
-                temperature = 0.2
-            };
-
-            var json = JsonSerializer.Serialize(requestBody);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
-            apiClient.DefaultRequestHeaders.Add("api-key", _meAiApiKey);
-
-            var response = await apiClient.PostAsync(fullUrl, content);
-            var responseJson = await response.Content.ReadAsStringAsync();
-            var aiResponse = JsonSerializer.Deserialize<AiResponse>(responseJson);
-
-            if (aiResponse?.Choices == null || aiResponse.Choices.Count == 0)
-                return new QueryDescription { Type = "standard" };
-
-            var outputContent = aiResponse.Choices[0].Message.Content;
-            return JsonSerializer.Deserialize<QueryDescription>(outputContent, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-                ?? new QueryDescription { Type = "standard" };
+                Success = true,
+                Type = "top-request-areas",
+                Data = topAreas,
+                Period = $"{dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}",
+                TotalRecords = topAreas.Sum(x => x.Count),
+                Timestamp = DateTime.UtcNow
+            });
         }
 
-        // Fetch requests from ManageEngine API
-        private async Task<List<Dictionary<string, object>>> FetchRequestsFromManageEngine(DateTimeOffset dateFrom, DateTimeOffset dateTo)
+        // Handler: Request influx (hour-by-hour or day-by-day analysis)
+        private async Task<IActionResult> HandleRequestInflux(Dictionary<string, object> parameters)
+        {
+            var (dateFrom, dateTo) = ExtractDateRange(parameters);
+            var groupBy = parameters.ContainsKey("groupBy") ? parameters["groupBy"]?.ToString() : "hour";
+
+            if (groupBy == "hour")
+            {
+                var hourlyData = await _dbContext.ManageEngineRequests
+                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo)
+                    .GroupBy(r => new { Date = r.CreatedTime.Date, Hour = r.CreatedTime.Hour })
+                    .Select(g => new
+                    {
+                        DateTime = g.Key.Date.AddHours(g.Key.Hour),
+                        Count = g.Count(),
+                        DisplayTime = $"{g.Key.Date:yyyy-MM-dd} {g.Key.Hour:D2}:00"
+                    })
+                    .OrderBy(x => x.DateTime)
+                    .ToListAsync();
+
+                var peakHour = hourlyData.OrderByDescending(x => x.Count).FirstOrDefault();
+
+                return Ok(new
+                {
+                    Success = true,
+                    Type = "request-influx",
+                    Data = hourlyData,
+                    Peak = peakHour,
+                    PeakMessage = peakHour != null ? $"Highest influx at {peakHour.DisplayTime} with {peakHour.Count} requests" : "No data",
+                    Period = $"{dateFrom:yyyy-MM-dd HH:mm:ss} to {dateTo:yyyy-MM-dd HH:mm:ss}",
+                    TotalRecords = hourlyData.Sum(x => x.Count),
+                    Timestamp = DateTime.UtcNow
+                });
+            }
+            else // day
+            {
+                var dailyData = await _dbContext.ManageEngineRequests
+                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo)
+                    .GroupBy(r => r.CreatedTime.Date)
+                    .Select(g => new
+                    {
+                        Date = g.Key,
+                        Count = g.Count(),
+                        DisplayDate = g.Key.ToString("yyyy-MM-dd")
+                    })
+                    .OrderBy(x => x.Date)
+                    .ToListAsync();
+
+                var peakDay = dailyData.OrderByDescending(x => x.Count).FirstOrDefault();
+
+                return Ok(new
+                {
+                    Success = true,
+                    Type = "request-influx",
+                    Data = dailyData,
+                    Peak = peakDay,
+                    PeakMessage = peakDay != null ? $"Highest influx on {peakDay.DisplayDate} with {peakDay.Count} requests" : "No data",
+                    Period = $"{dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}",
+                    TotalRecords = dailyData.Sum(x => x.Count),
+                    Timestamp = DateTime.UtcNow
+                });
+            }
+        }
+
+        // Handler: Inactive technicians
+        private async Task<IActionResult> HandleInactiveTechnicians(Dictionary<string, object> parameters)
+        {
+            var (dateFrom, dateTo) = ExtractDateRange(parameters);
+
+            var allTechnicians = await _dbContext.ManageEngineRequests
+                .Where(r => !string.IsNullOrEmpty(r.TechnicianName))
+                .Select(r => r.TechnicianName)
+                .Distinct()
+                .ToListAsync();
+
+            var activeTechnicians = await _dbContext.ManageEngineRequests
+                .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.TechnicianName))
+                .Select(r => r.TechnicianName)
+                .Distinct()
+                .ToListAsync();
+
+            var inactiveTechs = allTechnicians.Except(activeTechnicians).ToList();
+
+            return Ok(new
+            {
+                Success = true,
+                Type = "inactive-technicians",
+                Data = inactiveTechs,
+                InactiveCount = inactiveTechs.Count,
+                TotalTechnicians = allTechnicians.Count,
+                Period = $"{dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}",
+                Timestamp = DateTime.UtcNow
+            });
+        }
+
+        // Handler: Technician workload
+        private async Task<IActionResult> HandleTechnicianWorkload(Dictionary<string, object> parameters)
+        {
+            var (dateFrom, dateTo) = ExtractDateRange(parameters);
+
+            var workload = await _dbContext.ManageEngineRequests
+                .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.TechnicianName))
+                .GroupBy(r => r.TechnicianName)
+                .Select(g => new { Technician = g.Key, RequestCount = g.Count() })
+                .OrderByDescending(x => x.RequestCount)
+                .ToListAsync();
+
+            return Ok(new
+            {
+                Success = true,
+                Type = "technician-workload",
+                Data = workload,
+                Total = workload.Sum(x => x.RequestCount),
+                HighestWorkload = workload.FirstOrDefault(),
+                Period = $"{dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}",
+                Timestamp = DateTime.UtcNow
+            });
+        }
+
+        // Handler: Requests by subject
+        private async Task<IActionResult> HandleRequestsBySubject(Dictionary<string, object> parameters)
+        {
+            var (dateFrom, dateTo) = ExtractDateRange(parameters);
+            var subject = parameters.ContainsKey("subject") ? parameters["subject"]?.ToString() : null;
+
+            if (string.IsNullOrEmpty(subject))
+                return BadRequest(new { Success = false, Error = "Subject is required" });
+
+            var requests = await _dbContext.ManageEngineRequests
+                .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && r.Subject.Contains(subject))
+                .OrderByDescending(r => r.CreatedTime)
+                .Take(100)
+                .Select(r => new
+                {
+                    r.Id,
+                    r.Subject,
+                    r.TechnicianName,
+                    r.CreatedTime,
+                    JsonData = JsonDocument.Parse(r.JsonData, new JsonDocumentOptions()).RootElement
+                })
+                .ToListAsync();
+
+            return Ok(new
+            {
+                Success = true,
+                Type = "requests-by-subject",
+                Data = requests,
+                Count = requests.Count,
+                Subject = subject,
+                Period = $"{dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}",
+                Timestamp = DateTime.UtcNow
+            });
+        }
+
+        // Handler: Requests by technician
+        private async Task<IActionResult> HandleRequestsByTechnician(Dictionary<string, object> parameters)
+        {
+            var (dateFrom, dateTo) = ExtractDateRange(parameters);
+            var technician = parameters.ContainsKey("technician") ? parameters["technician"]?.ToString() : null;
+
+            if (string.IsNullOrEmpty(technician))
+                return BadRequest(new { Success = false, Error = "Technician is required" });
+
+            var requests = await _dbContext.ManageEngineRequests
+                .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && r.TechnicianName.Contains(technician))
+                .OrderByDescending(r => r.CreatedTime)
+                .Take(100)
+                .Select(r => new
+                {
+                    r.Id,
+                    r.Subject,
+                    r.TechnicianName,
+                    r.CreatedTime,
+                    JsonData = JsonDocument.Parse(r.JsonData, new JsonDocumentOptions()).RootElement
+                })
+                .ToListAsync();
+
+            return Ok(new
+            {
+                Success = true,
+                Type = "requests-by-technician",
+                Data = requests,
+                Count = requests.Count,
+                Technician = technician,
+                Period = $"{dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}",
+                Timestamp = DateTime.UtcNow
+            });
+        }
+
+        // Handler: General search
+        private async Task<IActionResult> HandleGeneralSearch(Dictionary<string, object> parameters)
+        {
+            var (dateFrom, dateTo) = ExtractDateRange(parameters);
+            var subject = parameters.ContainsKey("subject") ? parameters["subject"]?.ToString() : null;
+            var technician = parameters.ContainsKey("technician") ? parameters["technician"]?.ToString() : null;
+
+            var query = _dbContext.ManageEngineRequests
+                .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo);
+
+            if (!string.IsNullOrEmpty(subject))
+                query = query.Where(r => r.Subject.Contains(subject));
+
+            if (!string.IsNullOrEmpty(technician))
+                query = query.Where(r => r.TechnicianName.Contains(technician));
+
+            var requests = await query
+                .OrderByDescending(r => r.CreatedTime)
+                .Take(100)
+                .Select(r => new
+                {
+                    r.Id,
+                    r.Subject,
+                    r.TechnicianName,
+                    r.CreatedTime,
+                    JsonData = JsonDocument.Parse(r.JsonData, new JsonDocumentOptions()).RootElement
+                })
+                .ToListAsync();
+
+            return Ok(new
+            {
+                Success = true,
+                Type = "general-search",
+                Data = requests,
+                Count = requests.Count,
+                Filters = new { subject, technician },
+                Period = $"{dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}",
+                Timestamp = DateTime.UtcNow
+            });
+        }
+
+        // Fetch records from ManageEngine API
+        private async Task<List<Dictionary<string, object>>> FetchFromManageEngine(DateTimeOffset dateFrom, DateTimeOffset dateTo)
         {
             var apiClient = _httpClientFactory.CreateClient();
             apiClient.Timeout = TimeSpan.FromSeconds(60);
+
+            var accessToken = await GetZohoAccessToken();
+            apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Zoho-oauthtoken", accessToken);
 
             var allRequests = new List<Dictionary<string, object>>();
             var seenIds = new HashSet<string>();
@@ -753,7 +530,7 @@ Query: {userQuery}";
                 ["values"] = new[] { dateFromMs.ToString(), dateToMs.ToString() }
             };
 
-            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(15));
 
             while (hasMoreRows && pageNumber <= 50)
             {
@@ -777,9 +554,15 @@ Query: {userQuery}";
                 if (!response.IsSuccessStatusCode)
                 {
                     if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
-                        throw new Exception("Unauthorized access to ManageEngine API.");
+                    {
+                        _cache.Remove("ZohoAccessToken");
+                        accessToken = await GetZohoAccessToken();
+                        apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Zoho-oauthtoken", accessToken);
+                        response = await apiClient.GetAsync(url, cts.Token);
+                    }
 
-                    throw new Exception($"Failed to fetch requests: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
+                    if (!response.IsSuccessStatusCode)
+                        throw new Exception($"ManageEngine API error: {response.StatusCode}");
                 }
 
                 string jsonResponse = await response.Content.ReadAsStringAsync(cts.Token);
@@ -796,10 +579,8 @@ Query: {userQuery}";
 
                 hasMoreRows = false;
                 if (data.TryGetValue("list_info", out var listInfoObj) && listInfoObj is JsonElement listInfoElem)
-                {
                     if (listInfoElem.TryGetProperty("has_more_rows", out var hasMoreProp))
                         hasMoreRows = hasMoreProp.GetBoolean();
-                }
 
                 pageNumber++;
                 if (hasMoreRows) await Task.Delay(50, cts.Token);
@@ -808,89 +589,171 @@ Query: {userQuery}";
             return allRequests;
         }
 
+        // Get Zoho access token
+        private async Task<string> GetZohoAccessToken()
+        {
+            const string cacheKey = "ZohoAccessToken";
+
+            if (_cache.TryGetValue(cacheKey, out string cachedToken))
+                return cachedToken;
+
+            try
+            {
+                var client = _httpClientFactory.CreateClient();
+                var formContent = new FormUrlEncodedContent(new[]
+                {
+                    new KeyValuePair<string, string>("refresh_token", _zohoRefreshToken),
+                    new KeyValuePair<string, string>("grant_type", "refresh_token"),
+                    new KeyValuePair<string, string>("client_id", _zohoClientId),
+                    new KeyValuePair<string, string>("client_secret", _zohoClientSecret),
+                    new KeyValuePair<string, string>("redirect_uri", _zohoRedirectUri)
+                });
+
+                var response = await client.PostAsync("https://accounts.zoho.com/oauth/v2/token", formContent);
+
+                if (!response.IsSuccessStatusCode)
+                    throw new Exception($"Failed to get Zoho token: {response.StatusCode}");
+
+                string jsonResponse = await response.Content.ReadAsStringAsync();
+                var data = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonResponse) ?? throw new Exception("Invalid Zoho response");
+
+                if (!data.TryGetValue("access_token", out var accessTokenObj))
+                    throw new Exception("Access token not found in Zoho response");
+
+                string accessToken = accessTokenObj.ToString();
+                int expiresIn = 3600;
+
+                if (data.TryGetValue("expires_in", out var expiresInObj) && int.TryParse(expiresInObj.ToString(), out int parsedExpiresIn))
+                    expiresIn = parsedExpiresIn;
+
+                _cache.Set(cacheKey, accessToken, TimeSpan.FromSeconds(expiresIn - 60));
+                return accessToken;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[AUTH] Error: {ex.Message}");
+                throw;
+            }
+        }
+
         // Import requests from CSV/XLSX
-        [HttpPost("import-requests")]
+        [HttpPost("import")]
         public async Task<IActionResult> ImportRequests(IFormFile file)
         {
             if (file == null || file.Length == 0)
-                return BadRequest("No file uploaded.");
+                return BadRequest(new { Success = false, Error = "No file uploaded" });
 
             var requests = new List<ManageEngineRequest>();
 
-            using var stream = file.OpenReadStream();
-
-            if (file.FileName.EndsWith(".csv", StringComparison.OrdinalIgnoreCase))
+            try
             {
-                using var reader = new StreamReader(stream);
-                using var csv = new CsvReader(reader, CultureInfo.InvariantCulture);
-                var records = csv.GetRecords<dynamic>().ToList();
+                using var stream = file.OpenReadStream();
 
-                foreach (var record in records)
+                if (file.FileName.EndsWith(".csv", StringComparison.OrdinalIgnoreCase))
                 {
-                    var dict = (IDictionary<string, object>)record;
-                    var request = new ManageEngineRequest
+                    using var reader = new StreamReader(stream);
+                    using var csv = new CsvReader(reader, CultureInfo.InvariantCulture);
+                    var records = csv.GetRecords<dynamic>().ToList();
+
+                    foreach (var record in records)
                     {
-                        Id = dict.ContainsKey("Request ID") ? dict["Request ID"]?.ToString() : Guid.NewGuid().ToString(),
-                        Subject = dict.ContainsKey("Subject") ? dict["Subject"]?.ToString() : null,
-                        TechnicianName = dict.ContainsKey("Technician") ? dict["Technician"]?.ToString() : null,
-                        CreatedTime = dict.ContainsKey("Created Date")
-                            ? DateTimeOffset.Parse(dict["Created Date"].ToString())
-                            : DateTimeOffset.UtcNow,
-                        JsonData = JsonSerializer.Serialize(dict)
-                    };
-                    requests.Add(request);
+                        var dict = (IDictionary<string, object>)record;
+                        requests.Add(new ManageEngineRequest
+                        {
+                            Id = dict.ContainsKey("Request ID") ? dict["Request ID"]?.ToString() : Guid.NewGuid().ToString(),
+                            Subject = dict.ContainsKey("Subject") ? dict["Subject"]?.ToString() : null,
+                            TechnicianName = dict.ContainsKey("Technician") ? dict["Technician"]?.ToString() : null,
+                            CreatedTime = dict.ContainsKey("Created Date")
+                                ? DateTimeOffset.Parse(dict["Created Date"].ToString())
+                                : DateTimeOffset.UtcNow,
+                            JsonData = JsonSerializer.Serialize(dict)
+                        });
+                    }
                 }
-            }
-            else if (file.FileName.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase))
-            {
-                using var package = new ExcelPackage(stream);
-                var worksheet = package.Workbook.Worksheets[0];
-                var rowCount = worksheet.Dimension.Rows;
-                var colCount = worksheet.Dimension.Columns;
-
-                var headers = new List<string>();
-                for (int col = 1; col <= colCount; col++)
-                    headers.Add(worksheet.Cells[1, col].Text);
-
-                for (int row = 2; row <= rowCount; row++)
+                else if (file.FileName.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase))
                 {
-                    var dict = new Dictionary<string, object>();
+                    using var package = new ExcelPackage(stream);
+                    var worksheet = package.Workbook.Worksheets[0];
+                    var rowCount = worksheet.Dimension.Rows;
+                    var colCount = worksheet.Dimension.Columns;
+
+                    var headers = new List<string>();
                     for (int col = 1; col <= colCount; col++)
-                        dict[headers[col - 1]] = worksheet.Cells[row, col].Text;
+                        headers.Add(worksheet.Cells[1, col].Text);
 
-                    var request = new ManageEngineRequest
+                    for (int row = 2; row <= rowCount; row++)
                     {
-                        Id = dict.ContainsKey("id") ? dict["id"]?.ToString() : Guid.NewGuid().ToString(),
-                        Subject = dict.ContainsKey("subject") ? dict["subject"]?.ToString() : null,
-                        TechnicianName = dict.ContainsKey("technician") ? dict["technician"]?.ToString() : null,
-                        CreatedTime = dict.ContainsKey("created_time")
-                            ? DateTimeOffset.Parse(dict["created_time"].ToString())
-                            : DateTimeOffset.UtcNow,
-                        JsonData = JsonSerializer.Serialize(dict)
-                    };
-                    requests.Add(request);
+                        var dict = new Dictionary<string, object>();
+                        for (int col = 1; col <= colCount; col++)
+                            dict[headers[col - 1]] = worksheet.Cells[row, col].Text;
+
+                        requests.Add(new ManageEngineRequest
+                        {
+                            Id = dict.ContainsKey("id") ? dict["id"]?.ToString() : Guid.NewGuid().ToString(),
+                            Subject = dict.ContainsKey("subject") ? dict["subject"]?.ToString() : null,
+                            TechnicianName = dict.ContainsKey("technician") ? dict["technician"]?.ToString() : null,
+                            CreatedTime = dict.ContainsKey("created_time")
+                                ? DateTimeOffset.Parse(dict["created_time"].ToString())
+                                : DateTimeOffset.UtcNow,
+                            JsonData = JsonSerializer.Serialize(dict)
+                        });
+                    }
                 }
+                else
+                {
+                    return BadRequest(new { Success = false, Error = "Unsupported file format. Use CSV or XLSX." });
+                }
+
+                var existingIds = await _dbContext.ManageEngineRequests
+                    .Select(r => r.Id)
+                    .ToHashSetAsync();
+
+                var newRequests = requests
+                    .Where(r => !existingIds.Contains(r.Id))
+                    .ToList();
+
+                await _dbContext.ManageEngineRequests.AddRangeAsync(newRequests);
+                await _dbContext.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    Success = true,
+                    Imported = newRequests.Count,
+                    Skipped = requests.Count - newRequests.Count,
+                    Timestamp = DateTime.UtcNow
+                });
             }
-            else
+            catch (Exception ex)
             {
-                return BadRequest("Unsupported file format. Please upload CSV or XLSX.");
+                return StatusCode(500, new { Success = false, Error = ex.Message });
             }
-
-            var existingIds = await _dbContext.ManageEngineRequests
-                .Select(r => r.Id)
-                .ToHashSetAsync();
-
-            var newRequests = requests
-                .Where(r => !existingIds.Contains(r.Id))
-                .ToList();
-
-            await _dbContext.ManageEngineRequests.AddRangeAsync(newRequests);
-            await _dbContext.SaveChangesAsync();
-
-            return Ok(new { Imported = newRequests.Count, Skipped = requests.Count - newRequests.Count });
         }
 
-        // Helper methods
+        // Helper: Extract date range from parameters
+        private (DateTimeOffset dateFrom, DateTimeOffset dateTo) ExtractDateRange(Dictionary<string, object> parameters)
+        {
+            var now = DateTime.UtcNow;
+            var dateFrom = now;
+            var dateTo = now;
+
+            if (parameters.ContainsKey("dateFrom") && DateTime.TryParse(parameters["dateFrom"]?.ToString(), out var from))
+                dateFrom = from;
+
+            if (parameters.ContainsKey("dateTo") && DateTime.TryParse(parameters["dateTo"]?.ToString(), out var to))
+                dateTo = to;
+
+            return (new DateTimeOffset(dateFrom), new DateTimeOffset(dateTo));
+        }
+
+        // Helper: Extract field from nested JSON
+        private string ExtractField(Dictionary<string, object> req, string fieldName)
+        {
+            if (req.TryGetValue(fieldName, out var value) && value != null)
+                return value.ToString();
+            return null;
+        }
+
+        // Helper: Extract technician name from nested JSON structure
         private string ExtractTechnicianName(Dictionary<string, object> req)
         {
             if (req.TryGetValue("technician", out var techObj) && techObj is JsonElement techElem && techElem.ValueKind == JsonValueKind.Object)
@@ -901,6 +764,7 @@ Query: {userQuery}";
             return null;
         }
 
+        // Helper: Extract created time from nested JSON structure
         private DateTimeOffset ExtractCreatedTime(Dictionary<string, object> req)
         {
             if (req.TryGetValue("created_time", out var ctObj) && ctObj is JsonElement ctElem && ctElem.ValueKind == JsonValueKind.Object)
@@ -912,27 +776,19 @@ Query: {userQuery}";
         }
     }
 
-    // Helper classes
-    public class AiQueryRequest { public string Query { get; set; } }
-    public class AdvancedQueryRequest { public string Query { get; set; } }
-    public record Filters(string? Subject, string? Technician, string? DateFrom, string? DateTo);
-
-    public class QueryType
+    // Request Models
+    public class QueryRequest
     {
-        public string Type { get; set; }
-        public int? Months { get; set; }
-        public int? Hour { get; set; }
+        public string Query { get; set; }
     }
 
-    public class QueryDescription
+    public class QueryIntent
     {
         public string Type { get; set; }
-        public string Subject { get; set; }
-        public string Technician { get; set; }
-        public string DateFrom { get; set; }
-        public string DateTo { get; set; }
+        public Dictionary<string, object> Parameters { get; set; } = new Dictionary<string, object>();
     }
 
+    // AI Response Models
     public class AiResponse
     {
         [JsonPropertyName("choices")]
