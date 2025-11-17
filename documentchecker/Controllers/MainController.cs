@@ -1070,12 +1070,12 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
 
                     var request = new ManageEngineRequest
                     {
-                        Id = dict.ContainsKey("id") ? dict["id"]?.ToString() : Guid.NewGuid().ToString(),
-                        Subject = dict.ContainsKey("subject") ? dict["subject"]?.ToString() : null,
-                        TechnicianName = dict.ContainsKey("technician") ? dict["technician"]?.ToString() : null,
-                        CreatedTime = dict.ContainsKey("created_time")
-                                        ? DateTimeOffset.Parse(dict["created_time"].ToString())
-                                        : DateTimeOffset.UtcNow,
+                        Id = dict.ContainsKey("Request ID") ? dict["Request ID"]?.ToString() : Guid.NewGuid().ToString(),
+                        Subject = dict.ContainsKey("Subject") ? dict["Subject"]?.ToString() : null,
+                        TechnicianName = dict.ContainsKey("Technician") ? dict["Technician"]?.ToString() : null,
+                        CreatedTime = dict.ContainsKey("Created Date")
+                        ? DateTimeOffset.Parse(dict["Created Date"].ToString())
+                        : DateTimeOffset.UtcNow,
                         JsonData = JsonSerializer.Serialize(dict)
                     };
 
