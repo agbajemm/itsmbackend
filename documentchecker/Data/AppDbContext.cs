@@ -9,6 +9,7 @@ public class AppDbContext : DbContext
     public DbSet<ChatConversation> ChatConversations => Set<ChatConversation>();
     public DbSet<ChatMessage> ChatMessages => Set<ChatMessage>();
     public DbSet<ManageEngineQuery> ManageEngineQueries => Set<ManageEngineQuery>();
+    public DbSet<ManageEngineRequest> ManageEngineRequests { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

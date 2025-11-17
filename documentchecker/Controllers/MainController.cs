@@ -12,11 +12,14 @@ using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
 using System.Xml.Linq;
 using static System.Runtime.InteropServices.JavaScript.JSType;
+using Microsoft.EntityFrameworkCore; // Ensure this is included for EF Core extensions
+using System.Dynamic; // For dynamic if needed, but we'll avoid it
 
 namespace documentchecker.Controllers
 {
@@ -32,16 +35,21 @@ namespace documentchecker.Controllers
         private readonly string _clientSecret;
         private readonly string _refreshToken;
         private readonly string _redirectUri;
-
         private readonly ChatService _chatService;
         private readonly QueryHistoryService _queryHistoryService;
+        private readonly string _meAiEndpoint;
+        private readonly string _meAiDeploymentName;
+        private readonly string _meAiApiVersion;
+        private readonly string _meAiApiKey;
+        private readonly RequestStorageService _requestStorageService; // New service for storing requests
 
         public MainController(
             IConfiguration configuration,
             IHttpClientFactory httpClientFactory,
             IMemoryCache cache,
             ChatService chatService,
-            QueryHistoryService queryHistoryService)
+            QueryHistoryService queryHistoryService,
+            RequestStorageService requestStorageService) // Inject the new service
         {
             _projectEndpoint = configuration["AzureAIFoundry:ProjectEndpoint"] ?? throw new InvalidOperationException("ProjectEndpoint not configured.");
             _agentId = configuration["AzureAIFoundry:AgentId"] ?? "asst_MqwY6PBQdS9uxha6Hl1RQCJk";
@@ -51,92 +59,190 @@ namespace documentchecker.Controllers
             _clientSecret = configuration["Zoho:ClientSecret"] ?? throw new InvalidOperationException("Zoho:ClientSecret not configured.");
             _refreshToken = configuration["Zoho:RefreshToken"] ?? throw new InvalidOperationException("Zoho:RefreshToken not configured.");
             _redirectUri = configuration["Zoho:RedirectUri"] ?? throw new InvalidOperationException("Zoho:RedirectUri not configured.");
-
             _chatService = chatService;
             _queryHistoryService = queryHistoryService;
+            // New AI configuration for ManageEngine query parsing
+            _meAiEndpoint = configuration["ManageEngineAI:Endpoint"] ?? throw new InvalidOperationException("ManageEngineAI:Endpoint not configured.");
+            _meAiDeploymentName = configuration["ManageEngineAI:DeploymentName"] ?? throw new InvalidOperationException("ManageEngineAI:DeploymentName not configured.");
+            _meAiApiVersion = configuration["ManageEngineAI:ApiVersion"] ?? throw new InvalidOperationException("ManageEngineAI:ApiVersion not configured.");
+            _meAiApiKey = configuration["ManageEngineAI:ApiKey"] ?? throw new InvalidOperationException("ManageEngineAI:ApiKey not configured.");
+            _requestStorageService = requestStorageService;
         }
 
-        [HttpPost("agent-chat")]
-        public async Task<IActionResult> AgentChat([FromBody] AgentChatRequest request)
+        // Updated endpoint for natural language queries
+        [HttpPost("ai-query")]
+        public async Task<IActionResult> AiQuery([FromBody] AiQueryRequest request)
         {
-            if (string.IsNullOrEmpty(request.Message))
+            if (string.IsNullOrEmpty(request?.Query))
             {
-                return BadRequest("Message is required.");
+                return BadRequest("Query is required.");
             }
-
-            // Start conversation in DB
-            var conversationId = await _chatService.StartConversationAsync();
-            await _chatService.AddMessageAsync(conversationId, "user", request.Message);
 
             try
             {
-                var client = new PersistentAgentsClient(_projectEndpoint, new DefaultAzureCredential());
+                var queryType = await DetectQueryTypeFromAI(request.Query);
 
-                var agentResponse = await client.Administration.GetAgentAsync(_agentId);
-                PersistentAgent agent = agentResponse.Value;
-
-                var threadResponse = await client.Threads.CreateThreadAsync();
-                PersistentAgentThread thread = threadResponse.Value;
-
-                await client.Messages.CreateMessageAsync(thread.Id, MessageRole.User, request.Message);
-
-                var runResponse = await client.Runs.CreateRunAsync(
-                    thread.Id,
-                    _agentId,
-                    additionalInstructions: request.AdditionalInstructions
-                );
-                ThreadRun run = runResponse.Value;
-
-                do
+                // Route to specialized endpoints if detected
+                if (queryType.Type == "top-request-areas" && queryType.Months.HasValue)
                 {
-                    await Task.Delay(500);
-                    var getRunResponse = await client.Runs.GetRunAsync(thread.Id, run.Id);
-                    run = getRunResponse.Value;
-                }
-                while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress || run.Status == RunStatus.RequiresAction);
-
-                if (run.Status == RunStatus.Failed)
-                {
-                    await _chatService.AddMessageAsync(conversationId, "system", $"Run failed: {run.LastError?.Message}");
-                    return StatusCode(500, new { Error = $"Run failed: {run.LastError?.Message}" });
+                    return await GetTopRequestAreas(queryType.Months.Value);
                 }
 
-                var messagesAsync = client.Messages.GetMessagesAsync(thread.Id, order: ListSortOrder.Ascending);
-                var agentResponses = new List<string>();
-                await foreach (var message in messagesAsync)
+                if (queryType.Type == "inactive-technicians" && queryType.Months.HasValue)
                 {
-                    if (message.Role == MessageRole.Agent)
-                    {
-                        foreach (var content in message.ContentItems)
-                        {
-                            if (content is MessageTextContent textContent)
-                            {
-                                agentResponses.Add(textContent.Text);
-                                await _chatService.AddMessageAsync(conversationId, "agent", textContent.Text);
-                            }
-                        }
-                    }
+                    return await GetInactiveTechnicians(queryType.Months.Value);
                 }
 
-                return Ok(new { ConversationId = conversationId, Responses = agentResponses });
+                // Fall back to standard filter-based query
+                var filters = await GetFiltersFromAI(request.Query);
+                Console.WriteLine($"Extracted filters: Subject={filters.Subject}, DateFrom={filters.DateFrom}, DateTo={filters.DateTo}, Technician={filters.Technician}");
+                return await TestManageEngine(filters.Subject, filters.DateFrom, filters.DateTo, filters.Technician);
             }
             catch (Exception ex)
             {
-                await _chatService.AddMessageAsync(conversationId, "system", $"Error: {ex.Message}");
-                return StatusCode(500, new { Error = ex.Message });
+                return StatusCode(500, new { Error = $"AI query processing failed: {ex.Message}" });
             }
         }
 
-        [HttpGet("chat-history/{conversationId}")]
-        public async Task<IActionResult> GetChatHistory(int conversationId)
+        private async Task<QueryType> DetectQueryTypeFromAI(string userQuery)
         {
-            var messages = await _chatService.GetConversationAsync(conversationId);
-            if (!messages.Any())
+            var apiClient = _httpClientFactory.CreateClient();
+            var fullUrl = $"{_meAiEndpoint}openai/deployments/{_meAiDeploymentName}/chat/completions?api-version={_meAiApiVersion}";
+
+            var detectionPrompt = $@"Analyze this query and determine its type. Return ONLY a JSON object.
+If the query is asking for:
+1. Top/most common request areas/categories - return {{""type"": ""top-request-areas"", ""months"": <number>}}
+2. Inactive technicians - return {{""type"": ""inactive-technicians"", ""months"": <number>}}
+3. Otherwise - return {{""type"": ""standard"", ""months"": null}}
+
+Extract the number of months from relative time expressions (e.g., 'last 3 months' = 3, 'past year' = 12, default = 1 if not specified).
+Output ONLY the JSON object, no other text.
+
+Examples:
+Query: Show me the top request areas for the last 3 months
+Output: {{""type"": ""top-request-areas"", ""months"": 3}}
+
+Query: Which technicians have been inactive in the past 6 months?
+Output: {{""type"": ""inactive-technicians"", ""months"": 6}}
+
+Query: Show password reset tickets from October
+Output: {{""type"": ""standard"", ""months"": null}}
+
+User query: {userQuery}";
+
+            var requestBody = new
             {
-                return NotFound("Conversation not found.");
+                messages = new[]
+                {
+            new { role = "user", content = detectionPrompt }
+        },
+                max_tokens = 100,
+                temperature = 0.1
+            };
+
+            var json = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            apiClient.DefaultRequestHeaders.Add("api-key", _meAiApiKey);
+
+            var response = await apiClient.PostAsync(fullUrl, content);
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorContent = await response.Content.ReadAsStringAsync();
+                throw new Exception($"Query type detection failed: {response.StatusCode} - {errorContent}");
             }
 
-            return Ok(new { Messages = messages });
+            var responseJson = await response.Content.ReadAsStringAsync();
+            var aiResponse = JsonSerializer.Deserialize<AiResponse>(responseJson);
+
+            if (aiResponse?.Choices == null || aiResponse.Choices.Count == 0)
+            {
+                return new QueryType { Type = "standard", Months = null };
+            }
+
+            var outputContent = aiResponse.Choices[0].Message.Content;
+            Console.WriteLine($"Query type detection output: {outputContent}");
+
+            var queryType = JsonSerializer.Deserialize<QueryType>(outputContent, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                ?? new QueryType { Type = "standard", Months = null };
+
+            return queryType;
+        }
+
+        private async Task<Filters> GetFiltersFromAI(string userQuery)
+        {
+            var apiClient = _httpClientFactory.CreateClient();
+            var fullUrl = $"{_meAiEndpoint}openai/deployments/{_meAiDeploymentName}/chat/completions?api-version={_meAiApiVersion}";
+
+            string currentDate = DateTime.UtcNow.ToString("yyyy-MM-dd");
+            var systemPrompt = $@"You are an AI that converts natural language queries into structured filters for querying ManageEngine ServiceDesk requests. 
+The current date is {currentDate}. Use this to calculate absolute dates for any relative time expressions (e.g., 'last week' means 7 days ago, 'past month' means 30 days ago, 'this year' means from January 1 of this year).
+The filters are: 
+- subject: string to search in subject using 'contains' condition. Extract key phrases or topics from the query.
+- technician: string to search in technician name using 'contains' condition. Extract names or parts of names mentioned.
+- dateFrom: yyyy-MM-dd, start of range for created_time. Infer if a start date or range is implied.
+- dateTo: yyyy-MM-dd, end of range for created_time. Infer if an end date is implied, default to today if open-ended.
+Set to null only if absolutely no information can be inferred for that filter.
+Output only a JSON object with keys 'subject', 'technician', 'dateFrom', 'dateTo'. Do not include any other text or explanations.
+
+Examples:
+User query: show requests about password reset
+Output: {{""subject"": ""password reset"", ""technician"": null, ""dateFrom"": null, ""dateTo"": null}}
+
+User query: tickets handled by John in the last month
+Output: {{""subject"": null, ""technician"": ""John"", ""dateFrom"": ""{DateTime.Parse(currentDate).AddMonths(-1).ToString("yyyy-MM-dd")}"", ""dateTo"": ""{currentDate}""}}
+
+User query: issues from October 1, 2025 to November 1, 2025
+Output: {{""subject"": ""issues"", ""technician"": null, ""dateFrom"": ""2025-10-01"", ""dateTo"": ""2025-11-01""}}
+
+User query: tickets handled by John in the last month, with the mention of software
+Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{DateTime.Parse(currentDate).AddMonths(-1).ToString("yyyy-MM-dd")}"", ""dateTo"": ""{currentDate}""}}";
+
+            var userPrompt = $"User query: {userQuery}";
+
+            var requestBody = new
+            {
+                messages = new[]
+                {
+            new { role = "system", content = systemPrompt },
+            new { role = "user", content = userPrompt }
+        },
+                max_tokens = 200,
+                temperature = 0.2
+            };
+
+            var json = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            apiClient.DefaultRequestHeaders.Add("api-key", _meAiApiKey);
+
+            var response = await apiClient.PostAsync(fullUrl, content);
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorContent = await response.Content.ReadAsStringAsync();
+                throw new Exception($"AI API request failed: {response.StatusCode} - {errorContent}");
+            }
+
+            var responseJson = await response.Content.ReadAsStringAsync();
+            var aiResponse = JsonSerializer.Deserialize<AiResponse>(responseJson);
+
+            if (aiResponse?.Choices == null || aiResponse.Choices.Count == 0)
+            {
+                throw new Exception("Invalid AI response format.");
+            }
+
+            var outputContent = aiResponse.Choices[0].Message.Content;
+            Console.WriteLine($"AI output: {outputContent}");
+
+            var filters = JsonSerializer.Deserialize<Filters>(outputContent, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                ?? throw new Exception("Failed to parse filters from AI response.");
+
+            return filters;
+        }
+
+        // Helper class for query type detection
+        public class QueryType
+        {
+            public string Type { get; set; }
+            public int? Months { get; set; }
         }
 
         [HttpGet("test-manageengine")]
@@ -149,18 +255,14 @@ namespace documentchecker.Controllers
             var logger = _httpClientFactory.CreateClient("LoggingClient");
             var apiClient = _httpClientFactory.CreateClient();
             apiClient.Timeout = TimeSpan.FromSeconds(60); // 60 seconds per request
-
             int pageNumber = 1;
             try
             {
                 string accessToken = await GetAccessTokenAsync();
-
                 using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
                 await LogDetails(logger, "Start", new { Timestamp = DateTime.UtcNow, Details = "Fetching requests from ManageEngine API" });
-
                 apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
                     "Zoho-oauthtoken", accessToken);
-
                 var allRequests = new List<Dictionary<string, object>>();
                 var seenIds = new HashSet<string>();
                 int totalUnfiltered = 0;
@@ -169,7 +271,6 @@ namespace documentchecker.Controllers
                 const int emptyPageThreshold = 5;
                 const int rowCount = 100;
                 const int maxTotalRecords = 500;
-
                 long? dateFromMs = null, dateToMs = null;
                 if (!string.IsNullOrEmpty(dateFrom) || !string.IsNullOrEmpty(dateTo))
                 {
@@ -182,7 +283,6 @@ namespace documentchecker.Controllers
                     if (dateFromMs == null && dateToMs != null || dateFromMs != null && dateToMs == null)
                         return BadRequest("Both dateFrom and dateTo must be provided for date range filtering.");
                 }
-
                 var searchCriteriaList = new List<Dictionary<string, object>>();
                 if (!string.IsNullOrEmpty(subject))
                 {
@@ -211,7 +311,6 @@ namespace documentchecker.Controllers
                         ["values"] = new[] { dateFromMs.ToString(), dateToMs.ToString() }
                     });
                 }
-
                 object? searchCriteria = null;
                 if (searchCriteriaList.Count > 0)
                 {
@@ -228,7 +327,6 @@ namespace documentchecker.Controllers
                         searchCriteria = searchCriteriaList;
                     }
                 }
-
                 while (hasMoreRows && pageNumber <= 10 && (maxTotalRecords == 0 || totalUnfiltered < maxTotalRecords))
                 {
                     var startTime = DateTime.UtcNow;
@@ -246,7 +344,6 @@ namespace documentchecker.Controllers
                     var encodedInputData = HttpUtility.UrlEncode(inputDataJson);
                     string url = $"https://sdpondemand.manageengine.com/api/v3/requests?input_data={encodedInputData}";
                     var response = await apiClient.GetAsync(url, cts.Token);
-
                     if (!response.IsSuccessStatusCode)
                     {
                         if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
@@ -258,12 +355,10 @@ namespace documentchecker.Controllers
                                 "Zoho-oauthtoken", accessToken);
                             response = await apiClient.GetAsync(url, cts.Token);
                         }
-
                         if (!response.IsSuccessStatusCode)
                         {
                             var errorDetails = new { StatusCode = (int)response.StatusCode, Reason = response.ReasonPhrase, Page = pageNumber };
                             await LogDetails(logger, "Failure", errorDetails);
-
                             var reducedRowCount = Math.Min(rowCount / 2, 50);
                             listInfo = new
                             {
@@ -279,7 +374,6 @@ namespace documentchecker.Controllers
                             encodedInputData = HttpUtility.UrlEncode(inputDataJson);
                             url = $"https://sdpondemand.manageengine.com/api/v3/requests?input_data={encodedInputData}";
                             response = await apiClient.GetAsync(url, cts.Token);
-
                             if (!response.IsSuccessStatusCode)
                             {
                                 url = "https://sdpondemand.manageengine.com/api/v3/requests";
@@ -289,12 +383,10 @@ namespace documentchecker.Controllers
                             }
                         }
                     }
-
                     string jsonResponse = await response.Content.ReadAsStringAsync(cts.Token);
                     var data = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonResponse) ?? new Dictionary<string, object>();
                     var requestsElem = data.ContainsKey("requests") ? (JsonElement)data["requests"] : JsonDocument.Parse("[]").RootElement;
                     var currentRequests = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(requestsElem.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new List<Dictionary<string, object>>();
-
                     int rowsThisPage = 0;
                     foreach (var req in currentRequests)
                     {
@@ -305,7 +397,6 @@ namespace documentchecker.Controllers
                             rowsThisPage++;
                         }
                     }
-
                     hasMoreRows = false;
                     if (data.TryGetValue("list_info", out var listInfoObj) && listInfoObj is JsonElement listInfoElem)
                     {
@@ -314,20 +405,15 @@ namespace documentchecker.Controllers
                             hasMoreRows = hasMoreProp.GetBoolean();
                         }
                     }
-
                     if (rowsThisPage == 0) consecutiveEmptyPages++;
                     else consecutiveEmptyPages = 0;
-
                     var elapsedMs = (int)(DateTime.UtcNow - startTime).TotalMilliseconds;
                     await LogDetails(logger, "PageFetched", new { PageNumber = pageNumber, RowsThisPage = rowsThisPage, HasMoreRows = hasMoreRows, TotalUnfilteredSoFar = totalUnfiltered, ElapsedMs = elapsedMs });
-
                     pageNumber++;
                     if (hasMoreRows && consecutiveEmptyPages < emptyPageThreshold) await Task.Delay(50, cts.Token);
                     else if (consecutiveEmptyPages >= emptyPageThreshold) hasMoreRows = false;
                 }
-
                 var filteredRequests = allRequests;
-
                 var resultDetails = new
                 {
                     TotalPages = pageNumber - 1,
@@ -336,7 +422,6 @@ namespace documentchecker.Controllers
                     Timestamp = DateTime.UtcNow
                 };
                 await LogDetails(logger, "Success", resultDetails);
-
                 // Log to DB
                 var queryLog = new ManageEngineQuery
                 {
@@ -349,7 +434,6 @@ namespace documentchecker.Controllers
                     CacheKey = $"me-query-{subject}-{dateFrom}-{dateTo}-{technician}"
                 };
                 await _queryHistoryService.LogQueryAsync(queryLog);
-
                 return Ok(new { FilteredRequests = filteredRequests, Summary = resultDetails });
             }
             catch (TaskCanceledException ex)
@@ -368,13 +452,11 @@ namespace documentchecker.Controllers
         public async Task<IActionResult> GetTopRequestAreas(int months)
         {
             if (months < 1 || months > 3) return BadRequest("Months must be 1, 2, or 3.");
-
             var cacheKey = $"top-areas-{months}";
             if (_cache.TryGetValue(cacheKey, out object? cachedResult))
             {
                 return Ok(cachedResult);
             }
-
             try
             {
                 var dateTo = DateTimeOffset.UtcNow;
@@ -388,10 +470,8 @@ namespace documentchecker.Controllers
                     .OrderByDescending(x => x.Count)
                     .Take(10)
                     .ToList();
-
                 var result = new { TopAreas = topAreas, Period = $"{months} month(s)", Timestamp = DateTime.UtcNow };
                 _cache.Set(cacheKey, result, TimeSpan.FromDays(10));
-
                 // Log query to DB
                 var queryLog = new ManageEngineQuery
                 {
@@ -405,7 +485,6 @@ namespace documentchecker.Controllers
                     CacheKey = $"top-areas-{months}"
                 };
                 await _queryHistoryService.LogQueryAsync(queryLog);
-
                 return Ok(result);
             }
             catch (Exception ex)
@@ -418,13 +497,11 @@ namespace documentchecker.Controllers
         public async Task<IActionResult> GetInactiveTechnicians(int months)
         {
             if (months < 1 || months > 3) return BadRequest("Months must be 1, 2, or 3.");
-
             var cacheKey = $"inactive-techs-{months}";
             if (_cache.TryGetValue(cacheKey, out object? cachedResult))
             {
                 return Ok(cachedResult);
             }
-
             try
             {
                 var allTechnicians = await FetchAllTechnicians();
@@ -432,12 +509,10 @@ namespace documentchecker.Controllers
                     .Where(t => t.TryGetValue("name", out var nameObj) && nameObj != null && !string.IsNullOrEmpty(nameObj.ToString()))
                     .Select(t => t["name"].ToString().ToLowerInvariant())
                     .ToHashSet();
-
                 var dateTo = DateTimeOffset.UtcNow;
                 var temp = dateTo.AddMonths(-months);
                 var dateFrom = new DateTimeOffset(temp.Year, temp.Month, temp.Day, 0, 0, 0, TimeSpan.Zero);
                 var requests = await FetchRequestsForDateRange(dateFrom, dateTo);
-
                 var assignedTechs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var req in requests)
                 {
@@ -449,12 +524,9 @@ namespace documentchecker.Controllers
                         }
                     }
                 }
-
                 var inactive = allTechNames.Except(assignedTechs).Select(name => new { Name = name }).ToList();
-
                 var result = new { InactiveTechnicians = inactive, Period = $"{months} month(s)", TotalTechnicians = allTechNames.Count, Timestamp = DateTime.UtcNow };
                 _cache.Set(cacheKey, result, TimeSpan.FromDays(10));
-
                 // Log query to DB
                 var queryLog = new ManageEngineQuery
                 {
@@ -468,7 +540,6 @@ namespace documentchecker.Controllers
                     CacheKey = $"inactive-techs-{months}"
                 };
                 await _queryHistoryService.LogQueryAsync(queryLog);
-
                 return Ok(result);
             }
             catch (Exception ex)
@@ -507,6 +578,141 @@ namespace documentchecker.Controllers
             }
         }
 
+        [HttpGet("oldest-date")]
+        public async Task<IActionResult> GetOldestDate()
+        {
+            try
+            {
+                var requests = await FetchRequests(10, 1, "created_time", "asc"); // Fetch 10 oldest
+                if (requests.Count == 0)
+                {
+                    return NotFound("No records found.");
+                }
+
+                var oldestRequest = requests.OrderBy(r => {
+                    if (r.TryGetValue("created_time", out var ctObj) && ctObj is Dictionary<string, object> ctDict && ctDict.TryGetValue("milliseconds", out var msObj))
+                    {
+                        return Convert.ToInt64(msObj);
+                    }
+                    return long.MaxValue; // Fallback if missing
+                }).FirstOrDefault();
+
+                if (oldestRequest == null || !oldestRequest.TryGetValue("created_time", out var createdTimeObj) || createdTimeObj is not Dictionary<string, object> createdTimeDict || !createdTimeDict.TryGetValue("milliseconds", out var msObj))
+                {
+                    return BadRequest("Invalid created_time format in oldest request.");
+                }
+
+                var oldestDateMs = Convert.ToInt64(msObj);
+                var oldestDate = DateTimeOffset.FromUnixTimeMilliseconds(oldestDateMs).UtcDateTime;
+
+                return Ok(new { OldestDate = oldestDate.ToString("yyyy-MM-dd") });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Error = ex.Message });
+            }
+        }
+
+        // New endpoint to test maximum rows per page (assuming API max is 100, but can test higher if needed)
+        [HttpGet("max-rows-test")]
+        public async Task<IActionResult> TestMaxRows([FromQuery] int testRowCount = 100)
+        {
+            try
+            {
+                var requests = await FetchRequests(testRowCount, 1, "created_time", "desc");
+                return Ok(new { RowsFetched = requests.Count, TestRowCount = testRowCount });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Error = ex.Message });
+            }
+        }
+
+        // New endpoint for historical migration: Fetch month by month from oldest to now
+        [HttpPost("migrate-historical")]
+        public async Task<IActionResult> MigrateHistoricalData()
+        {
+            try
+            {
+                // Get oldest date
+                var oldestResult = await GetOldestDate();
+                if (oldestResult is not OkObjectResult okResult)
+                {
+                    return BadRequest("Failed to determine oldest date.");
+                }
+
+                if (okResult.Value is not Dictionary<string, object> valueDict || !valueDict.TryGetValue("OldestDate", out var oldestDateObj) || oldestDateObj is not string oldestDateStr)
+                {
+                    return BadRequest("Invalid oldest date format.");
+                }
+
+                var oldestDate = DateTime.Parse(oldestDateStr);
+                var currentDate = DateTime.UtcNow;
+
+                // Loop month by month
+                var startDate = oldestDate;
+                while (startDate < currentDate)
+                {
+                    var endDate = startDate.AddMonths(1).AddDays(-1); // End of month
+                    if (endDate > currentDate) endDate = currentDate;
+
+                    var dateFromMs = new DateTimeOffset(startDate).ToUnixTimeMilliseconds();
+                    var dateToMs = new DateTimeOffset(endDate).ToUnixTimeMilliseconds();
+
+                    var requests = await FetchRequestsForDateRange(new DateTimeOffset(startDate), new DateTimeOffset(endDate));
+                    foreach (var req in requests)
+                    {
+                        var requestId = req["id"].ToString();
+                        if (!await _requestStorageService.RequestExistsAsync(requestId))
+                        {
+                            await _requestStorageService.StoreRequestAsync(req);
+                        }
+                    }
+
+                    startDate = endDate.AddDays(1); // Next month
+                }
+
+                return Ok(new { Message = "Historical migration completed." });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Error = ex.Message });
+            }
+        }
+
+        // New endpoint to fetch and store new records (from last stored date to now)
+        [HttpPost("update-recent")]
+        public async Task<IActionResult> UpdateRecentData()
+        {
+            try
+            {
+                var lastStoredDate = await _requestStorageService.GetLastStoredDateAsync();
+                if (!lastStoredDate.HasValue)
+                {
+                    return BadRequest("No stored data found. Run historical migration first.");
+                }
+
+                var dateFrom = lastStoredDate.Value.AddDays(1); // Start from day after last
+                var dateTo = DateTimeOffset.UtcNow;
+
+                var requests = await FetchRequestsForDateRange(dateFrom, dateTo);
+                foreach (var req in requests)
+                {
+                    var requestId = req["id"].ToString();
+                    if (!await _requestStorageService.RequestExistsAsync(requestId))
+                    {
+                        await _requestStorageService.StoreRequestAsync(req);
+                    }
+                }
+
+                return Ok(new { Message = "Recent data updated.", NewRecords = requests.Count });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Error = ex.Message });
+            }
+        }
+
         private async Task<List<Dictionary<string, object>>> FetchRequestsForDateRange(DateTimeOffset dateFrom, DateTimeOffset dateTo)
         {
             var apiClient = _httpClientFactory.CreateClient();
@@ -514,10 +720,8 @@ namespace documentchecker.Controllers
             string accessToken = await GetAccessTokenAsync();
             apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
                 "Zoho-oauthtoken", accessToken);
-
             long dateFromMs = dateFrom.ToUnixTimeMilliseconds();
             long dateToMs = dateTo.ToUnixTimeMilliseconds();
-
             var searchCriteriaList = new List<Dictionary<string, object>>
             {
                 new Dictionary<string, object>
@@ -527,17 +731,13 @@ namespace documentchecker.Controllers
                     ["values"] = new[] { dateFromMs.ToString(), dateToMs.ToString() }
                 }
             };
-
             object searchCriteria = searchCriteriaList;
-
             var allRequests = new List<Dictionary<string, object>>();
             var seenIds = new HashSet<string>();
             bool hasMoreRows = true;
             int pageNumber = 1;
-            const int rowCount = 100;
-
+            const int rowCount = 25;
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
-
             while (hasMoreRows)
             {
                 var listInfo = new
@@ -554,7 +754,6 @@ namespace documentchecker.Controllers
                 var encodedInputData = HttpUtility.UrlEncode(inputDataJson);
                 string url = $"https://sdpondemand.manageengine.com/api/v3/requests?input_data={encodedInputData}";
                 var response = await apiClient.GetAsync(url, cts.Token);
-
                 if (!response.IsSuccessStatusCode)
                 {
                     if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
@@ -566,7 +765,6 @@ namespace documentchecker.Controllers
                             "Zoho-oauthtoken", accessToken);
                         response = await apiClient.GetAsync(url, cts.Token);
                     }
-
                     if (!response.IsSuccessStatusCode)
                     {
                         url = "https://sdpondemand.manageengine.com/api/v3/requests";
@@ -577,12 +775,10 @@ namespace documentchecker.Controllers
                         }
                     }
                 }
-
                 string jsonResponse = await response.Content.ReadAsStringAsync(cts.Token);
                 var data = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonResponse) ?? new Dictionary<string, object>();
                 var requestsElem = data.ContainsKey("requests") ? (JsonElement)data["requests"] : JsonDocument.Parse("[]").RootElement;
                 var currentRequests = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(requestsElem.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new List<Dictionary<string, object>>();
-
                 foreach (var req in currentRequests)
                 {
                     if (req.TryGetValue("id", out var idObj) && seenIds.Add(idObj.ToString()))
@@ -590,7 +786,6 @@ namespace documentchecker.Controllers
                         allRequests.Add(req);
                     }
                 }
-
                 hasMoreRows = false;
                 if (data.TryGetValue("list_info", out var listInfoObj) && listInfoObj is JsonElement listInfoElem)
                 {
@@ -599,10 +794,8 @@ namespace documentchecker.Controllers
                         hasMoreRows = hasMoreProp.GetBoolean();
                     }
                 }
-
                 pageNumber++;
             }
-
             return allRequests;
         }
 
@@ -613,11 +806,9 @@ namespace documentchecker.Controllers
             {
                 return cachedTechs;
             }
-
             var dateTo = DateTimeOffset.UtcNow;
             var dateFrom = new DateTimeOffset(2000, 1, 1, 0, 0, 0, TimeSpan.Zero);
             var requests = await FetchRequestsForDateRange(dateFrom, dateTo);
-
             var allTechnicians = new List<Dictionary<string, object>>();
             var seenIds = new HashSet<string>();
             foreach (var req in requests)
@@ -631,7 +822,6 @@ namespace documentchecker.Controllers
                     }
                 }
             }
-
             _cache.Set(cacheKey, allTechnicians, TimeSpan.FromDays(30));
             return allTechnicians;
         }
@@ -640,14 +830,12 @@ namespace documentchecker.Controllers
         {
             const string tokenCacheKey = "ZohoAccessToken";
             const string expirationCacheKey = "ZohoTokenExpiration";
-
             if (_cache.TryGetValue(tokenCacheKey, out string cachedToken) &&
                 _cache.TryGetValue(expirationCacheKey, out DateTime cachedExpiration) &&
                 DateTime.UtcNow < cachedExpiration)
             {
                 return cachedToken;
             }
-
             try
             {
                 var client = _httpClientFactory.CreateClient();
@@ -659,39 +847,30 @@ namespace documentchecker.Controllers
                     new KeyValuePair<string, string>("client_secret", _clientSecret),
                     new KeyValuePair<string, string>("redirect_uri", _redirectUri)
                 });
-
                 var response = await client.PostAsync("https://accounts.zoho.com/oauth/v2/token", formContent);
-
                 if (!response.IsSuccessStatusCode)
                 {
                     throw new Exception($"Failed to refresh Zoho access token: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
                 }
-
                 string jsonResponse = await response.Content.ReadAsStringAsync();
                 var data = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonResponse) ?? throw new Exception("Invalid response from Zoho token endpoint.");
-
                 if (data.TryGetValue("error", out var errorObj))
                 {
                     throw new Exception($"Zoho token error: {errorObj}");
                 }
-
                 if (!data.TryGetValue("access_token", out var accessTokenObj) || accessTokenObj == null)
                 {
                     throw new Exception("Access token not found in Zoho response.");
                 }
-
                 string accessToken = accessTokenObj.ToString()!;
-
                 int expiresIn = 3600;
                 if (data.TryGetValue("expires_in", out var expiresInObj) && int.TryParse(expiresInObj.ToString(), out int parsedExpiresIn))
                 {
                     expiresIn = parsedExpiresIn;
                 }
-
                 var expiration = DateTime.UtcNow.AddSeconds(expiresIn - 60);
                 _cache.Set(tokenCacheKey, accessToken, new MemoryCacheEntryOptions { AbsoluteExpiration = expiration });
                 _cache.Set(expirationCacheKey, expiration, new MemoryCacheEntryOptions { AbsoluteExpiration = expiration });
-
                 return accessToken;
             }
             catch (Exception ex)
@@ -715,11 +894,65 @@ namespace documentchecker.Controllers
                 Console.WriteLine($"Logging failed: {ex.Message}");
             }
         }
+
+        private async Task<List<Dictionary<string, object>>> FetchRequests(int rowCount, int startIndex, string sortField, string sortOrder, object? searchCriteria = null)
+        {
+            var apiClient = _httpClientFactory.CreateClient();
+            apiClient.Timeout = TimeSpan.FromSeconds(60);
+            string accessToken = await GetAccessTokenAsync();
+            apiClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Zoho-oauthtoken", accessToken);
+
+            var listInfo = new
+            {
+                row_count = rowCount,
+                start_index = startIndex,
+                sort_field = sortField,
+                sort_order = sortOrder,
+                get_total_count = true,
+                search_criteria = searchCriteria
+            };
+            var inputData = new { list_info = listInfo };
+            var inputDataJson = JsonSerializer.Serialize(inputData, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+            var encodedInputData = HttpUtility.UrlEncode(inputDataJson);
+            string url = $"https://sdpondemand.manageengine.com/api/v3/requests?input_data={encodedInputData}";
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+            var response = await apiClient.GetAsync(url, cts.Token);
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new Exception($"Failed to fetch requests: {response.StatusCode}");
+            }
+
+            string jsonResponse = await response.Content.ReadAsStringAsync(cts.Token);
+            var data = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonResponse) ?? new Dictionary<string, object>();
+            var requestsElem = data.ContainsKey("requests") ? (JsonElement)data["requests"] : JsonDocument.Parse("[]").RootElement;
+            return JsonSerializer.Deserialize<List<Dictionary<string, object>>>(requestsElem.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new List<Dictionary<string, object>>();
+        }
     }
 
-    public class AgentChatRequest
+    // Helper classes
+    public class AiQueryRequest
     {
-        public string Message { get; set; } = string.Empty;
-        public string? AdditionalInstructions { get; set; }
+        public string Query { get; set; }
+    }
+
+    public record Filters(string? Subject, string? Technician, string? DateFrom, string? DateTo);
+
+    public class AiResponse
+    {
+        [JsonPropertyName("choices")]
+        public List<AiChoice> Choices { get; set; }
+    }
+
+    public class AiChoice
+    {
+        [JsonPropertyName("message")]
+        public AiMessage Message { get; set; }
+    }
+
+    public class AiMessage
+    {
+        [JsonPropertyName("content")]
+        public string Content { get; set; }
     }
 }

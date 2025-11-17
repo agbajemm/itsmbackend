@@ -54,6 +54,7 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 // ---------------------------------------------------------------------
 builder.Services.AddScoped<ChatService>();
 builder.Services.AddScoped<QueryHistoryService>();
+builder.Services.AddScoped<RequestStorageService>();
 
 // ---------------------------------------------------------------------
 // 5. Build the app
