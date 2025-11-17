@@ -578,41 +578,6 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
             }
         }
 
-        [HttpGet("oldest-date")]
-        public async Task<IActionResult> GetOldestDate()
-        {
-            try
-            {
-                var requests = await FetchRequests(10, 1, "created_time", "asc"); // Fetch 10 oldest
-                if (requests.Count == 0)
-                {
-                    return NotFound("No records found.");
-                }
-
-                var oldestRequest = requests.OrderBy(r => {
-                    if (r.TryGetValue("created_time", out var ctObj) && ctObj is Dictionary<string, object> ctDict && ctDict.TryGetValue("milliseconds", out var msObj))
-                    {
-                        return Convert.ToInt64(msObj);
-                    }
-                    return long.MaxValue; // Fallback if missing
-                }).FirstOrDefault();
-
-                if (oldestRequest == null || !oldestRequest.TryGetValue("created_time", out var createdTimeObj) || createdTimeObj is not Dictionary<string, object> createdTimeDict || !createdTimeDict.TryGetValue("milliseconds", out var msObj))
-                {
-                    return BadRequest("Invalid created_time format in oldest request.");
-                }
-
-                var oldestDateMs = Convert.ToInt64(msObj);
-                var oldestDate = DateTimeOffset.FromUnixTimeMilliseconds(oldestDateMs).UtcDateTime;
-
-                return Ok(new { OldestDate = oldestDate.ToString("yyyy-MM-dd") });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { Error = ex.Message });
-            }
-        }
-
         // New endpoint to test maximum rows per page (assuming API max is 100, but can test higher if needed)
         [HttpGet("max-rows-test")]
         public async Task<IActionResult> TestMaxRows([FromQuery] int testRowCount = 100)
@@ -628,7 +593,48 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
             }
         }
 
-        // New endpoint for historical migration: Fetch month by month from oldest to now
+        [HttpGet("oldest-date")]
+        public async Task<IActionResult> GetOldestDate()
+        {
+            try
+            {
+                var requests = await FetchRequests(10, 1, "created_time", "asc"); // Fetch 10 oldest
+                if (requests.Count == 0)
+                {
+                    return NotFound("No records found.");
+                }
+
+                var oldestRequest = requests.OrderBy(r => {
+                    if (r.TryGetValue("created_time", out var ctObj) && ctObj is JsonElement ctElem && ctElem.ValueKind == JsonValueKind.Object)
+                    {
+                        if (ctElem.TryGetProperty("value", out var valElem) && valElem.ValueKind == JsonValueKind.String && long.TryParse(valElem.GetString(), out var ms))
+                        {
+                            return ms;
+                        }
+                    }
+                    return long.MaxValue; // Fallback if missing
+                }).FirstOrDefault();
+
+                if (oldestRequest == null || !oldestRequest.TryGetValue("created_time", out var createdTimeObj) || createdTimeObj is not JsonElement createdTimeElem || createdTimeElem.ValueKind != JsonValueKind.Object || !createdTimeElem.TryGetProperty("value", out var valElem) || valElem.ValueKind != JsonValueKind.String)
+                {
+                    return BadRequest("Invalid created_time format in oldest request.");
+                }
+
+                if (!long.TryParse(valElem.GetString(), out var oldestDateMs))
+                {
+                    return BadRequest("Invalid value in created_time.");
+                }
+                var oldestDate = DateTimeOffset.FromUnixTimeMilliseconds(oldestDateMs).UtcDateTime;
+
+                return Ok(new { OldestDate = oldestDate.ToString("yyyy-MM-dd") });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Error = ex.Message });
+            }
+        }
+
+        // Updated MigrateHistoricalData method in MainController
         [HttpPost("migrate-historical")]
         public async Task<IActionResult> MigrateHistoricalData()
         {
@@ -641,7 +647,7 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
                     return BadRequest("Failed to determine oldest date.");
                 }
 
-                if (okResult.Value is not Dictionary<string, object> valueDict || !valueDict.TryGetValue("OldestDate", out var oldestDateObj) || oldestDateObj is not string oldestDateStr)
+                if (okResult.Value is not { } value || value.GetType().GetProperty("OldestDate")?.GetValue(value) is not string oldestDateStr)
                 {
                     return BadRequest("Invalid oldest date format.");
                 }
