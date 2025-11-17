@@ -42,6 +42,7 @@ namespace documentchecker.Controllers
         private readonly string _meAiApiVersion;
         private readonly string _meAiApiKey;
         private readonly RequestStorageService _requestStorageService; // New service for storing requests
+        private readonly AppDbContext _dbContext;
 
         public MainController(
             IConfiguration configuration,
@@ -49,7 +50,8 @@ namespace documentchecker.Controllers
             IMemoryCache cache,
             ChatService chatService,
             QueryHistoryService queryHistoryService,
-            RequestStorageService requestStorageService) // Inject the new service
+            RequestStorageService requestStorageService,
+            AppDbContext dbContext) // Inject the new service
         {
             _projectEndpoint = configuration["AzureAIFoundry:ProjectEndpoint"] ?? throw new InvalidOperationException("ProjectEndpoint not configured.");
             _agentId = configuration["AzureAIFoundry:AgentId"] ?? "asst_MqwY6PBQdS9uxha6Hl1RQCJk";
@@ -67,6 +69,7 @@ namespace documentchecker.Controllers
             _meAiApiVersion = configuration["ManageEngineAI:ApiVersion"] ?? throw new InvalidOperationException("ManageEngineAI:ApiVersion not configured.");
             _meAiApiKey = configuration["ManageEngineAI:ApiKey"] ?? throw new InvalidOperationException("ManageEngineAI:ApiKey not configured.");
             _requestStorageService = requestStorageService;
+            _dbContext = dbContext;
         }
 
         // Updated endpoint for natural language queries
@@ -640,23 +643,32 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
         {
             try
             {
-                // Get oldest date
-                var oldestResult = await GetOldestDate();
-                if (oldestResult is not OkObjectResult okResult)
+                // Get the last stored date from DB (if any)
+                var lastStoredDate = await _requestStorageService.GetLastStoredDateAsync();
+
+                DateTime startFromDate;
+                if (lastStoredDate.HasValue)
                 {
-                    return BadRequest("Failed to determine oldest date.");
+                    // Resume from the day after the last stored date
+                    startFromDate = lastStoredDate.Value.UtcDateTime.AddDays(1);
+                    Console.WriteLine($"Resuming migration from {startFromDate:yyyy-MM-dd}");
+                }
+                else
+                {
+                    // No records: Start from Jan 1, 2025
+                    startFromDate = new DateTime(2025, 1, 1);
+                    Console.WriteLine("Starting new migration from Jan 1, 2025");
                 }
 
-                if (okResult.Value is not { } value || value.GetType().GetProperty("OldestDate")?.GetValue(value) is not string oldestDateStr)
-                {
-                    return BadRequest("Invalid oldest date format.");
-                }
-
-                var oldestDate = DateTime.Parse(oldestDateStr);
                 var currentDate = DateTime.UtcNow;
 
-                // Loop month by month
-                var startDate = oldestDate;
+                if (startFromDate > currentDate)
+                {
+                    return Ok(new { Message = "Migration already up to date." });
+                }
+
+                // Loop month by month from startFromDate onward
+                var startDate = startFromDate;
                 while (startDate < currentDate)
                 {
                     var endDate = startDate.AddMonths(1).AddDays(-1); // End of month
@@ -664,6 +676,9 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
 
                     var dateFromMs = new DateTimeOffset(startDate).ToUnixTimeMilliseconds();
                     var dateToMs = new DateTimeOffset(endDate).ToUnixTimeMilliseconds();
+
+                    // Log the current batch for monitoring
+                    Console.WriteLine($"Processing batch: {startDate:yyyy-MM-dd} to {endDate:yyyy-MM-dd}");
 
                     var requests = await FetchRequestsForDateRange(new DateTimeOffset(startDate), new DateTimeOffset(endDate));
                     foreach (var req in requests)
@@ -678,7 +693,7 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
                     startDate = endDate.AddDays(1); // Next month
                 }
 
-                return Ok(new { Message = "Historical migration completed." });
+                return Ok(new { Message = "Historical migration completed or updated." });
             }
             catch (Exception ex)
             {
@@ -712,6 +727,99 @@ Output: {{""subject"": ""software"", ""technician"": ""John"", ""dateFrom"": ""{
                 }
 
                 return Ok(new { Message = "Recent data updated.", NewRecords = requests.Count });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Error = ex.Message });
+            }
+        }
+
+        [HttpGet("distinct-technicians")]
+        public async Task<IActionResult> GetDistinctTechnicians()
+        {
+            try
+            {
+                var technicians = await _dbContext.ManageEngineRequests
+                    .Where(r => !string.IsNullOrEmpty(r.TechnicianName))
+                    .Select(r => r.TechnicianName)
+                    .Distinct()
+                    .ToListAsync();
+
+                return Ok(technicians);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Error = ex.Message });
+            }
+        }
+
+        // 2. Inactive technicians over a period (custom dateFrom and dateTo)
+        [HttpGet("inactive-technicians")]
+        public async Task<IActionResult> GetInactiveTechnicians([FromQuery] DateTime dateFrom, [FromQuery] DateTime dateTo)
+        {
+            try
+            {
+                // Get all distinct technicians (ever)
+                var allTechnicians = await _dbContext.ManageEngineRequests
+                    .Where(r => !string.IsNullOrEmpty(r.TechnicianName))
+                    .Select(r => r.TechnicianName)
+                    .Distinct()
+                    .ToListAsync();
+
+                // Get active technicians in the date range
+                var activeTechnicians = await _dbContext.ManageEngineRequests
+                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.TechnicianName))
+                    .Select(r => r.TechnicianName)
+                    .Distinct()
+                    .ToListAsync();
+
+                // Inactive = all - active
+                var inactive = allTechnicians.Except(activeTechnicians).ToList();
+
+                return Ok(new { InactiveTechnicians = inactive, Period = $"{dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}" });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Error = ex.Message });
+            }
+        }
+
+        // 3. Influx of requests per hour in a date range (counts per hour)
+        [HttpGet("requests-per-hour")]
+        public async Task<IActionResult> GetRequestsPerHour([FromQuery] DateTime dateFrom, [FromQuery] DateTime dateTo)
+        {
+            try
+            {
+                var hourlyCounts = await _dbContext.ManageEngineRequests
+                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo)
+                    .GroupBy(r => new { r.CreatedTime.Date, r.CreatedTime.Hour })
+                    .Select(g => new { Date = g.Key.Date, Hour = g.Key.Hour, Count = g.Count() })
+                    .OrderBy(x => x.Date).ThenBy(x => x.Hour)
+                    .ToListAsync();
+
+                return Ok(hourlyCounts);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Error = ex.Message });
+            }
+        }
+
+        // 4. Top request areas (subjects) in a date range
+        [HttpGet("top-request-areas")]
+        public async Task<IActionResult> GetTopRequestAreas([FromQuery] DateTime dateFrom, [FromQuery] DateTime dateTo, [FromQuery] int topN = 10)
+        {
+            try
+            {
+                var topAreas = await _dbContext.ManageEngineRequests
+                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.Subject))
+                    .GroupBy(r => r.Subject)
+                    .Select(g => new { Subject = g.Key, Count = g.Count() })
+                    .OrderByDescending(x => x.Count)
+                    .Take(topN)
+                    .ToListAsync();
+
+                return Ok(new { TopAreas = topAreas, Period = $"{dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}" });
             }
             catch (Exception ex)
             {
