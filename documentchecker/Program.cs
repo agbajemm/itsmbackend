@@ -57,12 +57,13 @@ builder.Services.AddScoped<QueryHistoryService>();
 builder.Services.AddScoped<RequestStorageService>();
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowLocalhost3000",
+    options.AddPolicy("AllowReactApp",
         policy =>
         {
             policy.WithOrigins("http://localhost:3000")
                   .AllowAnyHeader()
-                  .AllowAnyMethod();
+                  .AllowAnyMethod()
+                  .AllowCredentials();
         });
 });
 
