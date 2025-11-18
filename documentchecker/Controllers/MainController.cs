@@ -285,7 +285,26 @@ User query: {userQuery}";
             var outputContent = aiResponse.Choices[0].Message.Content;
             Console.WriteLine($"Raw AI Output: {outputContent}");
 
-            var analysis = JsonSerializer.Deserialize<QueryAnalysis>(outputContent, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+            // Clean up markdown formatting if AI wrapped JSON in backticks
+            var cleanedContent = outputContent.Trim();
+            if (cleanedContent.StartsWith("```json"))
+            {
+                cleanedContent = cleanedContent.Substring(7); // Remove ```json
+            }
+            else if (cleanedContent.StartsWith("```"))
+            {
+                cleanedContent = cleanedContent.Substring(3); // Remove ```
+            }
+
+            if (cleanedContent.EndsWith("```"))
+            {
+                cleanedContent = cleanedContent.Substring(0, cleanedContent.Length - 3); // Remove trailing ```
+            }
+
+            cleanedContent = cleanedContent.Trim();
+            Console.WriteLine($"Cleaned AI Output: {cleanedContent}");
+
+            var analysis = JsonSerializer.Deserialize<QueryAnalysis>(cleanedContent, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
                 ?? throw new Exception("Failed to parse query analysis.");
 
             return analysis;
