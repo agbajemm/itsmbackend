@@ -122,6 +122,9 @@ namespace documentchecker.Controllers
 
             try
             {
+                // Start sync in background - don't await, don't block user request
+                _ = SyncRequestsInBackground();
+
                 var queryAnalysis = await AnalyzeQueryWithAI(request.Query);
                 Console.WriteLine($"Query Analysis: {JsonSerializer.Serialize(queryAnalysis)}");
 
@@ -149,6 +152,43 @@ namespace documentchecker.Controllers
             catch (Exception ex)
             {
                 return StatusCode(500, new { Error = $"Query processing failed: {ex.Message}", Details = ex.StackTrace });
+            }
+        }
+
+        private async Task SyncRequestsInBackground()
+        {
+            try
+            {
+                var lastStoredDate = await _requestStorageService.GetLastStoredDateAsync();
+                DateTimeOffset dateFrom;
+
+                if (lastStoredDate.HasValue)
+                {
+                    dateFrom = lastStoredDate.Value.AddMinutes(-5);
+                }
+                else
+                {
+                    dateFrom = DateTimeOffset.UtcNow.AddMonths(-1);
+                }
+
+                var dateTo = DateTimeOffset.UtcNow;
+                var requests = await FetchRequestsForDateRange(dateFrom, dateTo);
+
+                foreach (var req in requests)
+                {
+                    var requestId = req["id"].ToString();
+                    if (!await _requestStorageService.RequestExistsAsync(requestId))
+                    {
+                        await _requestStorageService.StoreRequestAsync(req);
+                    }
+                }
+
+                Console.WriteLine($"Background sync completed: Fetched {requests.Count} requests");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Background sync error (non-blocking): {ex.Message}");
+                // Error is logged but doesn't propagate - user query continues normally
             }
         }
 
