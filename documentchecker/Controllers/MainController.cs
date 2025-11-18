@@ -120,6 +120,22 @@ namespace documentchecker.Controllers
                 return BadRequest("Query is required.");
             }
 
+            string sessionId = string.IsNullOrEmpty(request.SessionId) ? Guid.NewGuid().ToString() : request.SessionId;
+
+            var conversation = await _dbContext.ChatConversations
+                .Include(c => c.Messages)
+                .FirstOrDefaultAsync(c => c.SessionId == sessionId);
+
+            if (conversation == null)
+            {
+                conversation = new ChatConversation { SessionId = sessionId };
+                _dbContext.ChatConversations.Add(conversation);
+            }
+
+            var userMessage = new ChatMessage { Role = "user", Content = request.Query };
+            conversation.Messages.Add(userMessage);
+            await _dbContext.SaveChangesAsync();
+
             try
             {
                 // Start sync in background - don't await, don't block user request
@@ -128,31 +144,86 @@ namespace documentchecker.Controllers
                 var queryAnalysis = await AnalyzeQueryWithAI(request.Query);
                 Console.WriteLine($"Query Analysis: {JsonSerializer.Serialize(queryAnalysis)}");
 
+                IActionResult queryResult;
                 switch (queryAnalysis.QueryType)
                 {
                     case "inactive_technicians":
-                        return await HandleInactiveTechniciansQuery(queryAnalysis);
+                        queryResult = await HandleInactiveTechniciansQuery(queryAnalysis);
+                        break;
 
                     case "influx_requests":
-                        return await HandleInfluxRequestsQuery(queryAnalysis);
+                        queryResult = await HandleInfluxRequestsQuery(queryAnalysis);
+                        break;
 
                     case "top_request_areas":
-                        return await HandleTopRequestAreasQuery(queryAnalysis);
+                        queryResult = await HandleTopRequestAreasQuery(queryAnalysis);
+                        break;
 
                     case "top_technicians":
-                        return await HandleTopTechniciansQuery(queryAnalysis);
+                        queryResult = await HandleTopTechniciansQuery(queryAnalysis);
+                        break;
 
                     case "request_search":
-                        return await HandleRequestSearchQuery(queryAnalysis);
+                        queryResult = await HandleRequestSearchQuery(queryAnalysis);
+                        break;
 
                     default:
-                        return BadRequest("Unable to determine query type.");
+                        queryResult = BadRequest("Unable to determine query type.");
+                        break;
+                }
+
+                string agentContent;
+                if (queryResult is ObjectResult objectResult && objectResult.Value != null)
+                {
+                    agentContent = JsonSerializer.Serialize(objectResult.Value);
+                }
+                else
+                {
+                    agentContent = "Unknown response";
+                }
+
+                var agentMessage = new ChatMessage { Role = "agent", Content = agentContent };
+                conversation.Messages.Add(agentMessage);
+                await _dbContext.SaveChangesAsync();
+
+                if (queryResult is OkObjectResult okResult && okResult.Value != null)
+                {
+                    return Ok(new { SessionId = sessionId, Data = okResult.Value });
+                }
+                else
+                {
+                    return queryResult;
                 }
             }
             catch (Exception ex)
             {
-                return StatusCode(500, new { Error = $"Query processing failed: {ex.Message}", Details = ex.StackTrace });
+                var errorContent = JsonSerializer.Serialize(new { Error = $"Query processing failed: {ex.Message}", Details = ex.StackTrace });
+                var agentMessage = new ChatMessage { Role = "agent", Content = errorContent };
+                conversation.Messages.Add(agentMessage);
+                await _dbContext.SaveChangesAsync();
+
+                return Ok(new { SessionId = sessionId, Data = new { Error = $"Query processing failed: {ex.Message}", Details = ex.StackTrace } });
             }
+        }
+
+        [HttpGet("chat-history/{sessionId}")]
+        public async Task<IActionResult> GetChatHistory(string sessionId)
+        {
+            var conversation = await _dbContext.ChatConversations
+                .Include(c => c.Messages)
+                .FirstOrDefaultAsync(c => c.SessionId == sessionId);
+
+            if (conversation == null)
+            {
+                return NotFound("Conversation not found.");
+            }
+
+            var history = conversation.Messages
+                .OrderBy(m => m.SentAt)
+                .Select(m => new { m.Role, m.Content, m.SentAt })
+                .ToList();
+
+            return Ok(new { SessionId = sessionId, StartedAt = conversation.StartedAt, Messages = history });
         }
 
         private async Task SyncRequestsInBackground()
@@ -852,6 +923,7 @@ User query: {userQuery}";
     public class NaturalQueryRequest
     {
         public string Query { get; set; }
+        public string? SessionId { get; set; }
     }
 
     public class QueryAnalysis
