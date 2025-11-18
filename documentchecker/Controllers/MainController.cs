@@ -132,6 +132,11 @@ namespace documentchecker.Controllers
                 _dbContext.ChatConversations.Add(conversation);
             }
 
+            if (string.IsNullOrEmpty(conversation.UserEmail) && !string.IsNullOrEmpty(request.UserEmail))
+            {
+                conversation.UserEmail = request.UserEmail;
+            }
+
             var userMessage = new ChatMessage { Role = "user", Content = request.Query };
             conversation.Messages.Add(userMessage);
             await _dbContext.SaveChangesAsync();
@@ -924,6 +929,7 @@ User query: {userQuery}";
     {
         public string Query { get; set; }
         public string? SessionId { get; set; }
+        public string? UserEmail { get; set; }
     }
 
     public class QueryAnalysis

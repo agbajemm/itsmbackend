@@ -55,6 +55,16 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 builder.Services.AddScoped<ChatService>();
 builder.Services.AddScoped<QueryHistoryService>();
 builder.Services.AddScoped<RequestStorageService>();
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowLocalhost3000",
+        policy =>
+        {
+            policy.WithOrigins("http://localhost:3000")
+                  .AllowAnyHeader()
+                  .AllowAnyMethod();
+        });
+});
 
 // ---------------------------------------------------------------------
 // 5. Build the app
@@ -76,6 +86,8 @@ app.UseCors("AllowSwaggerOrigins");
 
 // Force HTTPS (optional in prod, recommended)
 app.UseHttpsRedirection();
+
+app.UseCors("AllowLocalhost3000");
 
 app.UseAuthorization();
 
