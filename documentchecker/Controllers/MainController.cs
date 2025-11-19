@@ -184,7 +184,7 @@ namespace documentchecker.Controllers
                 // Generate conversational response
                 var conversationalText = await GenerateConversationalResponseAsync(rawData, queryAnalysis, request.Query);
                 // Generate file name and URL
-                var fileName = $"query_result_{DateTime.UtcNow.ToString("yyyyMMdd_HHmmss")}.xlsx";
+                var fileName = $"query_result_{DateTime.UtcNow.ToString("yyyyMMdd_HHmmss")}.csv";
                 var url = $"/api/Main/download-result/{sessionId}/{fileName}";
                 var finalResponseFull = new
                 {
