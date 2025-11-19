@@ -251,71 +251,6 @@ namespace documentchecker.Controllers
             return File(csvBytes, "text/csv", csvFileName);
         }
 
-        // NEW: Super simple, zero-dependency CSV generator
-        private byte[] GenerateCsvFromData(JsonElement data)
-        {
-            var sb = new StringBuilder();
-
-            // Helper to safely get string value
-            string Safe(object? value) => value?.ToString()?.Replace("\"", "\"\"") ?? "";
-
-            if (data.TryGetProperty("QueryType", out var qt))
-            {
-                var type = qt.GetString();
-
-                switch (type)
-                {
-                    case "InactiveTechnicians":
-                        sb.AppendLine("Inactive Technician");
-                        foreach (var tech in data.GetProperty("InactiveTechnicians").EnumerateArray())
-                            sb.AppendLine($"\"{Safe(tech.GetString())}\"");
-                        break;
-
-                    case "TopRequestAreas":
-                        sb.AppendLine("Subject,Count");
-                        foreach (var item in data.GetProperty("TopAreas").EnumerateArray())
-                            sb.AppendLine($"\"{Safe(item.GetProperty("Subject").GetString())}\",\"{item.GetProperty("Count").GetInt32()}\"");
-                        break;
-
-                    case "TopTechnicians":
-                        sb.AppendLine("Technician,Requests Handled");
-                        foreach (var item in data.GetProperty("TopTechnicians").EnumerateArray())
-                            sb.AppendLine($"\"{Safe(item.GetProperty("Technician").GetString())}\",\"{item.GetProperty("RequestsHandled").GetInt32()}\"");
-                        break;
-
-                    case "InfluxRequests":
-                        if (data.TryGetProperty("HourlyData", out var hourly))
-                        {
-                            sb.AppendLine("DateTime,Count");
-                            foreach (var item in hourly.EnumerateArray())
-                                sb.AppendLine($"\"{item.GetProperty("DateTime").GetDateTime():yyyy-MM-dd HH:00}\",\"{item.GetProperty("Count").GetInt32()}\"");
-                        }
-                        else
-                        {
-                            sb.AppendLine("Date,Count");
-                            foreach (var item in data.GetProperty("DailyData").EnumerateArray())
-                                sb.AppendLine($"\"{item.GetProperty("Date").GetDateTime():yyyy-MM-dd}\",\"{item.GetProperty("Count").GetInt32()}\"");
-                        }
-                        break;
-
-                    case "RequestSearch":
-                        sb.AppendLine("ID,Subject,Technician,Created Time");
-                        foreach (var r in data.GetProperty("Requests").EnumerateArray())
-                        {
-                            var tech = r.TryGetProperty("TechnicianName", out var t) ? t.GetString() : "";
-                            sb.AppendLine($"\"{r.GetProperty("Id").GetString()}\",\"{Safe(r.GetProperty("Subject").GetString())}\",\"{Safe(tech)}\",\"{r.GetProperty("CreatedTime").GetDateTime():yyyy-MM-dd HH:mm}\"");
-                        }
-                        break;
-
-                    default:
-                        sb.AppendLine("No data available");
-                        break;
-                }
-            }
-
-            return Encoding.UTF8.GetBytes(sb.ToString());
-        }
-
         [HttpGet("chat-history/{sessionId}")]
         public async Task<IActionResult> GetChatHistory(string sessionId)
         {
@@ -960,7 +895,7 @@ User query: {userQuery}";
                 Total inactive: {data.GetProperty("TotalInactive").GetInt32()} out of {data.GetProperty("TotalTechnicians").GetInt32()}
                 Period: {data.GetProperty("Period").GetString()}
 
-                Respond in 2–4 warm, natural sentences. Be helpful and professional.
+                Respond in 2–4 warm, natural sentences. Be helpful and professional. Always explicitly list the first 10 inactive technicians in your response using bullet points.
                 """,
 
                 "influx_requests" => $"""
@@ -972,7 +907,7 @@ User query: {userQuery}";
                           data.TryGetProperty("PeakDay", out var pd) ? $"{pd.GetProperty("Date").GetDateTime():yyyy-MM-dd} ({pd.GetProperty("Count").GetInt32()} requests)" : "N/A")}
                 Total requests: {data.GetProperty("TotalRequests").GetInt32()}
 
-                Give a short, conversational summary highlighting the busiest time.
+                Give a short, conversational summary highlighting the busiest time. Always explicitly list the first 10 items in your response using bullet points.
                 """,
 
                 "top_request_areas" => $"""
@@ -980,7 +915,7 @@ User query: {userQuery}";
                 Top request categories (top 10 shown):
                 {previewText}
 
-                Respond naturally: mention the #1 area and maybe #2–3. Sound helpful and insightful.
+                Respond naturally: mention the #1 area and maybe #2–3. Sound helpful and insightful. Always explicitly list the first 10 categories in your response using bullet points.
                 """,
 
                 "top_technicians" => $"""
@@ -988,7 +923,7 @@ User query: {userQuery}";
                 Top performing technicians (top 10 shown):
                 {previewText}
 
-                Respond in a congratulatory, friendly tone. Shout out the top 1–3 and thank the team.
+                Respond in a congratulatory, friendly tone. Shout out the top 1–3 and thank the team. Always explicitly list the first 10 technicians in your response using bullet points.
                 """,
 
                 "request_search" => $"""
@@ -996,7 +931,7 @@ User query: {userQuery}";
                 Found {data.GetProperty("RequestsFound").GetInt32()} matching requests. First 10:
                 {previewText}
 
-                Respond naturally: confirm the search, highlight anything interesting, and mention full list is in Excel.
+                Respond naturally: confirm the search, highlight anything interesting, and mention full list is in Excel. Always explicitly list the first 10 requests in your response using bullet points.
                 """,
 
                 _ => "Here's the information you requested!"
@@ -1028,76 +963,69 @@ User query: {userQuery}";
             return result?.Choices?[0]?.Message?.Content?.Trim() ?? "Here's your data!";
         }
 
-        private byte[] GenerateExcelFromData(JsonElement data, string queryType)
+        private byte[] GenerateCsvFromData(JsonElement data)
         {
-            // ✅ Correct way in EPPlus 8+
+            var sb = new StringBuilder();
 
-            using var package = new ExcelPackage();
-            var ws = package.Workbook.Worksheets.Add("Results");
+            // Helper to safely get string value
+            string Safe(object? value) => value?.ToString()?.Replace("\"", "\"\"") ?? "";
 
-            switch (queryType)
+            if (data.TryGetProperty("QueryType", out var qt))
             {
-                case "inactive_technicians":
-                    var inactiveTechs = data.GetProperty("InactiveTechnicians").EnumerateArray()
-                        .Select(e => e.GetString()).ToList();
-                    ws.Cells["A1"].Value = "Inactive Technicians";
-                    ws.Cells["A2"].LoadFromCollection(inactiveTechs, false);
-                    break;
+                var type = qt.GetString();
 
-                case "top_request_areas":
-                    var topAreas = data.GetProperty("TopAreas").EnumerateArray()
-                        .Select(e => new { Subject = e.GetProperty("Subject").GetString(), Count = e.GetProperty("Count").GetInt32() })
-                        .ToList();
-                    ws.Cells["A1"].Value = "Subject";
-                    ws.Cells["B1"].Value = "Count";
-                    ws.Cells["A2"].LoadFromCollection(topAreas, true);
-                    break;
+                switch (type)
+                {
+                    case "InactiveTechnicians":
+                        sb.AppendLine("Inactive Technician");
+                        foreach (var tech in data.GetProperty("InactiveTechnicians").EnumerateArray())
+                            sb.AppendLine($"\"{Safe(tech.GetString())}\"");
+                        break;
 
-                case "top_technicians":
-                    var topTechs = data.GetProperty("TopTechnicians").EnumerateArray()
-                        .Select(e => new { Technician = e.GetProperty("Technician").GetString(), RequestsHandled = e.GetProperty("RequestsHandled").GetInt32() })
-                        .ToList();
-                    ws.Cells["A1"].Value = "Technician";
-                    ws.Cells["B1"].Value = "Requests Handled";
-                    ws.Cells["A2"].LoadFromCollection(topTechs, true);
-                    break;
+                    case "TopRequestAreas":
+                        sb.AppendLine("Subject,Count");
+                        foreach (var item in data.GetProperty("TopAreas").EnumerateArray())
+                            sb.AppendLine($"\"{Safe(item.GetProperty("Subject").GetString())}\",\"{item.GetProperty("Count").GetInt32()}\"");
+                        break;
 
-                case "influx_requests":
-                    string timeUnit = data.GetProperty("TimeUnit").GetString();
-                    if (timeUnit == "Hour")
-                    {
-                        var hourlyData = data.GetProperty("HourlyData").EnumerateArray()
-                            .Select(e => new { DateTime = e.GetProperty("DateTime").GetDateTime(), Count = e.GetProperty("Count").GetInt32() })
-                            .ToList();
-                        ws.Cells["A2"].LoadFromCollection(hourlyData, true);
-                    }
-                    else
-                    {
-                        var dailyData = data.GetProperty("DailyData").EnumerateArray()
-                            .Select(e => new { Date = e.GetProperty("Date").GetDateTime(), Count = e.GetProperty("Count").GetInt32() })
-                            .ToList();
-                        ws.Cells["A2"].LoadFromCollection(dailyData, true);
-                    }
-                    break;
+                    case "TopTechnicians":
+                        sb.AppendLine("Technician,Requests Handled");
+                        foreach (var item in data.GetProperty("TopTechnicians").EnumerateArray())
+                            sb.AppendLine($"\"{Safe(item.GetProperty("Technician").GetString())}\",\"{item.GetProperty("RequestsHandled").GetInt32()}\"");
+                        break;
 
-                case "request_search":
-                    var requests = data.GetProperty("Requests").EnumerateArray()
-                        .Select(e => new
+                    case "InfluxRequests":
+                        if (data.TryGetProperty("HourlyData", out var hourly))
                         {
-                            Id = e.GetProperty("Id").GetString(),
-                            Subject = e.GetProperty("Subject").GetString(),
-                            TechnicianName = e.GetProperty("TechnicianName").GetString(),
-                            CreatedTime = e.GetProperty("CreatedTime").GetDateTime()
-                        })
-                        .ToList();
-                    ws.Cells["A2"].LoadFromCollection(requests, true);
-                    break;
+                            sb.AppendLine("DateTime,Count");
+                            foreach (var item in hourly.EnumerateArray())
+                                sb.AppendLine($"\"{item.GetProperty("DateTime").GetDateTime():yyyy-MM-dd HH:00}\",\"{item.GetProperty("Count").GetInt32()}\"");
+                        }
+                        else
+                        {
+                            sb.AppendLine("Date,Count");
+                            foreach (var item in data.GetProperty("DailyData").EnumerateArray())
+                                sb.AppendLine($"\"{item.GetProperty("Date").GetDateTime():yyyy-MM-dd}\",\"{item.GetProperty("Count").GetInt32()}\"");
+                        }
+                        break;
+
+                    case "RequestSearch":
+                        sb.AppendLine("ID,Subject,Technician,Created Time");
+                        foreach (var r in data.GetProperty("Requests").EnumerateArray())
+                        {
+                            var tech = r.TryGetProperty("TechnicianName", out var t) ? t.GetString() : "";
+                            sb.AppendLine($"\"{r.GetProperty("Id").GetString()}\",\"{Safe(r.GetProperty("Subject").GetString())}\",\"{Safe(tech)}\",\"{r.GetProperty("CreatedTime").GetDateTime():yyyy-MM-dd HH:mm}\"");
+                        }
+                        break;
+
+                    default:
+                        sb.AppendLine("No data available");
+                        break;
+                }
             }
 
-            ws.Cells.AutoFitColumns();
-            return package.GetAsByteArray();
+            return Encoding.UTF8.GetBytes(sb.ToString());
         }
-
     }
 
     // Helper Classes
