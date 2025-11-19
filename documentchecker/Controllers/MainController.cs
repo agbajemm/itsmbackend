@@ -45,6 +45,7 @@ namespace documentchecker.Controllers
         private readonly string _meAiApiKey;
         private readonly RequestStorageService _requestStorageService;
         private readonly AppDbContext _dbContext;
+        private readonly IServiceProvider _serviceProvider;
 
         public MainController(
             IConfiguration configuration,
@@ -53,7 +54,8 @@ namespace documentchecker.Controllers
             ChatService chatService,
             QueryHistoryService queryHistoryService,
             RequestStorageService requestStorageService,
-            AppDbContext dbContext)
+            AppDbContext dbContext,
+            IServiceProvider serviceProvider)
         {
             _projectEndpoint = configuration["AzureAIFoundry:ProjectEndpoint"] ?? throw new InvalidOperationException("ProjectEndpoint not configured.");
             _agentId = configuration["AzureAIFoundry:AgentId"] ?? "asst_MqwY6PBQdS9uxha6Hl1RQCJk";
@@ -71,6 +73,7 @@ namespace documentchecker.Controllers
             _meAiApiKey = configuration["ManageEngineAI:ApiKey"] ?? throw new InvalidOperationException("ManageEngineAI:ApiKey not configured.");
             _requestStorageService = requestStorageService;
             _dbContext = dbContext;
+            _serviceProvider = serviceProvider;
         }
 
         [HttpPost("sync-requests")]
@@ -144,7 +147,24 @@ namespace documentchecker.Controllers
             try
             {
                 // Start sync in background - don't await, don't block user request
-                _ = SyncRequestsInBackground();
+                //_ = SyncRequestsInBackground();
+
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        using var scope = _serviceProvider.CreateScope();
+                        var backgroundDbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                        var backgroundRequestStorage = scope.ServiceProvider.GetRequiredService<RequestStorageService>();
+
+                        await SyncRequestsInBackgroundSafe(backgroundDbContext, backgroundRequestStorage);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Background sync failed: {ex.Message}");
+                        // Log it properly in production
+                    }
+                });
 
                 var queryAnalysis = await AnalyzeQueryWithAI(request.Query);
                 Console.WriteLine($"Query Analysis: {JsonSerializer.Serialize(queryAnalysis)}");
@@ -177,28 +197,46 @@ namespace documentchecker.Controllers
                         break;
                 }
 
-                string agentContent;
-                if (queryResult is ObjectResult objectResult && objectResult.Value != null)
-                {
-                    agentContent = JsonSerializer.Serialize(objectResult.Value);
-                }
-                else
-                {
-                    agentContent = "Unknown response";
-                }
-
-                var agentMessage = new ChatMessage { Role = "agent", Content = agentContent };
-                conversation.Messages.Add(agentMessage);
-                await _dbContext.SaveChangesAsync();
-
+                // Extract data from query result
+                object queryData = null;
                 if (queryResult is OkObjectResult okResult && okResult.Value != null)
                 {
-                    return Ok(new { SessionId = sessionId, Data = okResult.Value });
+                    queryData = okResult.Value;
                 }
                 else
                 {
+                    var agentMessage = new ChatMessage { Role = "agent", Content = "Unable to process query." };
+                    conversation.Messages.Add(agentMessage);
+                    await _dbContext.SaveChangesAsync();
                     return queryResult;
                 }
+
+                // Generate conversational response using AI
+                var conversationalResponse = await GenerateConversationalResponse(request.Query, queryData);
+
+                // Generate Excel file from the data
+                var excelFileBytes = await GenerateExcelFile(queryData, queryAnalysis.QueryType);
+                var excelFileName = $"query_result_{DateTime.UtcNow:yyyyMMdd_HHmmss}.xlsx";
+
+                // Combine response with file download link info
+                var finalResponse = new
+                {
+                    SessionId = sessionId,
+                    ConversationalResponse = conversationalResponse,
+                    ExcelFile = new
+                    {
+                        FileName = excelFileName,
+                        Data = Convert.ToBase64String(excelFileBytes),
+                        Url = $"/api/main/download-result/{sessionId}/{excelFileName}"
+                    }
+                };
+
+                var agentResponseContent = JsonSerializer.Serialize(finalResponse);
+                var agentChatMessage = new ChatMessage { Role = "agent", Content = agentResponseContent };
+                conversation.Messages.Add(agentChatMessage);
+                await _dbContext.SaveChangesAsync();
+
+                return Ok(finalResponse);
             }
             catch (Exception ex)
             {
@@ -231,21 +269,368 @@ namespace documentchecker.Controllers
             return Ok(new { SessionId = sessionId, StartedAt = conversation.StartedAt, Messages = history });
         }
 
-        private async Task SyncRequestsInBackground()
+        private async Task<string> GenerateConversationalResponse(string userQuery, object queryData)
         {
             try
             {
-                var lastStoredDate = await _requestStorageService.GetLastStoredDateAsync();
-                DateTimeOffset dateFrom;
+                var apiClient = _httpClientFactory.CreateClient();
+                var fullUrl = $"{_meAiEndpoint}openai/deployments/{_meAiDeploymentName}/chat/completions?api-version={_meAiApiVersion}";
 
-                if (lastStoredDate.HasValue)
+                // Serialize query data and limit to first 10 records for summary
+                string dataJson = JsonSerializer.Serialize(queryData);
+                string dataPreview = dataJson.Length > 2000 ? dataJson.Substring(0, 2000) + "..." : dataJson;
+
+                var conversationPrompt = $@"You are a helpful assistant analyzing IT support request data. 
+The user asked: ""{userQuery}""
+
+Here's the data summary (showing first 10 records or relevant summary):
+{dataPreview}
+
+Please provide a friendly, conversational response that:
+1. Directly answers the user's question based on the data
+2. Highlights key insights or patterns you notice
+3. Mentions that a complete Excel file with all data has been generated for download
+4. Keep the response concise (2-3 sentences) and natural
+
+Respond in a conversational tone, as if you're speaking to a colleague.";
+
+                var requestBody = new
                 {
-                    dateFrom = lastStoredDate.Value.AddMinutes(-5);
-                }
-                else
+                    messages = new[]
+                    {
+                        new { role = "user", content = conversationPrompt }
+                    },
+                    max_tokens = 300,
+                    temperature = 0.7
+                };
+
+                var json = JsonSerializer.Serialize(requestBody);
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+                apiClient.DefaultRequestHeaders.Add("api-key", _meAiApiKey);
+
+                var response = await apiClient.PostAsync(fullUrl, content);
+                if (!response.IsSuccessStatusCode)
                 {
-                    dateFrom = DateTimeOffset.UtcNow.AddMonths(-1);
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    throw new Exception($"AI response generation failed: {response.StatusCode} - {errorContent}");
                 }
+
+                var responseJson = await response.Content.ReadAsStringAsync();
+                var aiResponse = JsonSerializer.Deserialize<AiResponse>(responseJson);
+
+                if (aiResponse?.Choices == null || aiResponse.Choices.Count == 0)
+                {
+                    return "I've retrieved the data you requested. Please check the Excel file for detailed information.";
+                }
+
+                return aiResponse.Choices[0].Message.Content;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error generating conversational response: {ex.Message}");
+                return "I've processed your request and generated an Excel file with the results. Please download it for detailed information.";
+            }
+        }
+
+        private async Task<byte[]> GenerateExcelFile(object queryData, string queryType)
+        {
+            try
+            {
+                // Set EPPlus license context (required for EPPlus 5.0+)
+                ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
+
+                using var package = new ExcelPackage();
+                var worksheet = package.Workbook.Worksheets.Add("Query Results");
+
+                // Handle different query types
+                if (queryData is OkObjectResult result)
+                {
+                    queryData = result.Value;
+                }
+
+                var dataDict = JsonSerializer.Deserialize<Dictionary<string, object>>(
+                    JsonSerializer.Serialize(queryData));
+
+                int row = 1;
+
+                // Add header row with metadata
+                worksheet.Cells[row, 1].Value = $"Query Type: {queryType}";
+                worksheet.Cells[row, 1].Style.Font.Bold = true;
+                row += 2;
+
+                // Add data based on query type
+                switch (queryType)
+                {
+                    case "inactive_technicians":
+                        row = AddInactiveTechniciansToExcel(worksheet, dataDict, row);
+                        break;
+                    case "influx_requests":
+                        row = AddInfluxRequestsToExcel(worksheet, dataDict, row);
+                        break;
+                    case "top_request_areas":
+                        row = AddTopAreasToExcel(worksheet, dataDict, row);
+                        break;
+                    case "top_technicians":
+                        row = AddTopTechniciansToExcel(worksheet, dataDict, row);
+                        break;
+                    case "request_search":
+                        row = AddRequestSearchToExcel(worksheet, dataDict, row);
+                        break;
+                }
+
+                worksheet.Cells.AutoFitColumns();
+                return package.GetAsByteArray();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error generating Excel file: {ex.Message}");
+                return new byte[0];
+            }
+        }
+
+        private int AddInactiveTechniciansToExcel(ExcelWorksheet worksheet, Dictionary<string, object> data, int startRow)
+        {
+            int row = startRow;
+            worksheet.Cells[row, 1].Value = "Inactive Technicians Report";
+            worksheet.Cells[row, 1].Style.Font.Bold = true;
+            row += 2;
+
+            if (data.TryGetValue("Period", out var period))
+                worksheet.Cells[row++, 1].Value = $"Period: {period}";
+            if (data.TryGetValue("TotalInactive", out var totalInactive))
+                worksheet.Cells[row++, 1].Value = $"Total Inactive: {totalInactive}";
+            if (data.TryGetValue("TotalTechnicians", out var totalTechs))
+                worksheet.Cells[row++, 1].Value = $"Total Technicians: {totalTechs}";
+
+            row += 2;
+            worksheet.Cells[row, 1].Value = "Technician Name";
+            worksheet.Cells[row, 1].Style.Font.Bold = true;
+
+            if (data.TryGetValue("InactiveTechnicians", out var technicians))
+            {
+                var techList = JsonSerializer.Deserialize<List<string>>(
+                    JsonSerializer.Serialize(technicians));
+                foreach (var tech in techList ?? new List<string>())
+                {
+                    row++;
+                    worksheet.Cells[row, 1].Value = tech;
+                }
+            }
+
+            return row;
+        }
+
+        private int AddInfluxRequestsToExcel(ExcelWorksheet worksheet, Dictionary<string, object> data, int startRow)
+        {
+            int row = startRow;
+            worksheet.Cells[row, 1].Value = "Request Influx Report";
+            worksheet.Cells[row, 1].Style.Font.Bold = true;
+            row += 2;
+
+            if (data.TryGetValue("Period", out var period))
+                worksheet.Cells[row++, 1].Value = $"Period: {period}";
+            if (data.TryGetValue("TotalRequests", out var total))
+                worksheet.Cells[row++, 1].Value = $"Total Requests: {total}";
+
+            row += 2;
+            string timeUnit = "Hour";
+            if (data.TryGetValue("TimeUnit", out var unit))
+                timeUnit = unit.ToString();
+
+            worksheet.Cells[row, 1].Value = timeUnit;
+            worksheet.Cells[row, 2].Value = "Count";
+            worksheet.Cells[row, 1].Style.Font.Bold = true;
+            worksheet.Cells[row, 2].Style.Font.Bold = true;
+
+            if (timeUnit == "Hour" && data.TryGetValue("HourlyData", out var hourlyData))
+            {
+                var hourList = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(
+                    JsonSerializer.Serialize(hourlyData));
+                foreach (var item in hourList ?? new List<Dictionary<string, object>>())
+                {
+                    row++;
+                    if (item.TryGetValue("DateTime", out var dt))
+                        worksheet.Cells[row, 1].Value = dt;
+                    if (item.TryGetValue("Count", out var cnt))
+                        worksheet.Cells[row, 2].Value = cnt;
+                }
+            }
+            else if (timeUnit == "Day" && data.TryGetValue("DailyData", out var dailyData))
+            {
+                var dayList = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(
+                    JsonSerializer.Serialize(dailyData));
+                foreach (var item in dayList ?? new List<Dictionary<string, object>>())
+                {
+                    row++;
+                    if (item.TryGetValue("Date", out var date))
+                        worksheet.Cells[row, 1].Value = date;
+                    if (item.TryGetValue("Count", out var cnt))
+                        worksheet.Cells[row, 2].Value = cnt;
+                }
+            }
+
+            return row;
+        }
+
+        private int AddTopAreasToExcel(ExcelWorksheet worksheet, Dictionary<string, object> data, int startRow)
+        {
+            int row = startRow;
+            worksheet.Cells[row, 1].Value = "Top Request Areas Report";
+            worksheet.Cells[row, 1].Style.Font.Bold = true;
+            row += 2;
+
+            if (data.TryGetValue("Period", out var period))
+                worksheet.Cells[row++, 1].Value = $"Period: {period}";
+            if (data.TryGetValue("TopN", out var topN))
+                worksheet.Cells[row++, 1].Value = $"Top: {topN}";
+            if (data.TryGetValue("TotalRequests", out var total))
+                worksheet.Cells[row++, 1].Value = $"Total Requests: {total}";
+
+            row += 2;
+            worksheet.Cells[row, 1].Value = "Subject";
+            worksheet.Cells[row, 2].Value = "Count";
+            worksheet.Cells[row, 1].Style.Font.Bold = true;
+            worksheet.Cells[row, 2].Style.Font.Bold = true;
+
+            if (data.TryGetValue("TopAreas", out var areas))
+            {
+                var areaList = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(
+                    JsonSerializer.Serialize(areas));
+                foreach (var area in areaList ?? new List<Dictionary<string, object>>())
+                {
+                    row++;
+                    if (area.TryGetValue("Subject", out var subject))
+                        worksheet.Cells[row, 1].Value = subject;
+                    if (area.TryGetValue("Count", out var cnt))
+                        worksheet.Cells[row, 2].Value = cnt;
+                }
+            }
+
+            return row;
+        }
+
+        private int AddTopTechniciansToExcel(ExcelWorksheet worksheet, Dictionary<string, object> data, int startRow)
+        {
+            int row = startRow;
+            worksheet.Cells[row, 1].Value = "Top Technicians Report";
+            worksheet.Cells[row, 1].Style.Font.Bold = true;
+            row += 2;
+
+            if (data.TryGetValue("Period", out var period))
+                worksheet.Cells[row++, 1].Value = $"Period: {period}";
+            if (data.TryGetValue("TopN", out var topN))
+                worksheet.Cells[row++, 1].Value = $"Top: {topN}";
+            if (data.TryGetValue("TotalRequests", out var total))
+                worksheet.Cells[row++, 1].Value = $"Total Requests: {total}";
+
+            row += 2;
+            worksheet.Cells[row, 1].Value = "Technician";
+            worksheet.Cells[row, 2].Value = "Requests Handled";
+            worksheet.Cells[row, 1].Style.Font.Bold = true;
+            worksheet.Cells[row, 2].Style.Font.Bold = true;
+
+            if (data.TryGetValue("TopTechnicians", out var techs))
+            {
+                var techList = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(
+                    JsonSerializer.Serialize(techs));
+                foreach (var tech in techList ?? new List<Dictionary<string, object>>())
+                {
+                    row++;
+                    if (tech.TryGetValue("Technician", out var name))
+                        worksheet.Cells[row, 1].Value = name;
+                    if (tech.TryGetValue("RequestsHandled", out var handled))
+                        worksheet.Cells[row, 2].Value = handled;
+                }
+            }
+
+            return row;
+        }
+
+        private int AddRequestSearchToExcel(ExcelWorksheet worksheet, Dictionary<string, object> data, int startRow)
+        {
+            int row = startRow;
+            worksheet.Cells[row, 1].Value = "Request Search Results";
+            worksheet.Cells[row, 1].Style.Font.Bold = true;
+            row += 2;
+
+            if (data.TryGetValue("Period", out var period))
+                worksheet.Cells[row++, 1].Value = $"Period: {period}";
+            if (data.TryGetValue("RequestsFound", out var found))
+                worksheet.Cells[row++, 1].Value = $"Requests Found: {found}";
+
+            row += 2;
+            worksheet.Cells[row, 1].Value = "ID";
+            worksheet.Cells[row, 2].Value = "Subject";
+            worksheet.Cells[row, 3].Value = "Technician";
+            worksheet.Cells[row, 4].Value = "Created Time";
+            for (int i = 1; i <= 4; i++)
+                worksheet.Cells[row, i].Style.Font.Bold = true;
+
+            if (data.TryGetValue("Requests", out var requests))
+            {
+                var reqList = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(
+                    JsonSerializer.Serialize(requests));
+                foreach (var req in reqList ?? new List<Dictionary<string, object>>())
+                {
+                    row++;
+                    if (req.TryGetValue("Id", out var id))
+                        worksheet.Cells[row, 1].Value = id;
+                    if (req.TryGetValue("Subject", out var subject))
+                        worksheet.Cells[row, 2].Value = subject;
+                    if (req.TryGetValue("TechnicianName", out var tech))
+                        worksheet.Cells[row, 3].Value = tech;
+                    if (req.TryGetValue("CreatedTime", out var created))
+                        worksheet.Cells[row, 4].Value = created;
+                }
+            }
+
+            return row;
+        }
+
+        //private async Task SyncRequestsInBackground()
+        //{
+        //    try
+        //    {
+        //        var lastStoredDate = await _requestStorageService.GetLastStoredDateAsync();
+        //        DateTimeOffset dateFrom;
+
+        //        if (lastStoredDate.HasValue)
+        //        {
+        //            dateFrom = lastStoredDate.Value.AddMinutes(-5);
+        //        }
+        //        else
+        //        {
+        //            dateFrom = DateTimeOffset.UtcNow.AddMonths(-1);
+        //        }
+
+        //        var dateTo = DateTimeOffset.UtcNow;
+        //        var requests = await FetchRequestsForDateRange(dateFrom, dateTo);
+
+        //        foreach (var req in requests)
+        //        {
+        //            var requestId = req["id"].ToString();
+        //            if (!await _requestStorageService.RequestExistsAsync(requestId))
+        //            {
+        //                await _requestStorageService.StoreRequestAsync(req);
+        //            }
+        //        }
+
+        //        Console.WriteLine($"Background sync completed: Fetched {requests.Count} requests");
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        Console.WriteLine($"Background sync error (non-blocking): {ex.Message}");
+        //    }
+        //}
+
+        private async Task SyncRequestsInBackgroundSafe(AppDbContext dbContext, RequestStorageService requestStorageService)
+        {
+            try
+            {
+                var lastStoredDate = await requestStorageService.GetLastStoredDateAsync();
+                DateTimeOffset dateFrom = lastStoredDate.HasValue
+                    ? lastStoredDate.Value.AddMinutes(-5)
+                    : DateTimeOffset.UtcNow.AddMonths(-1);
 
                 var dateTo = DateTimeOffset.UtcNow;
                 var requests = await FetchRequestsForDateRange(dateFrom, dateTo);
@@ -253,18 +638,17 @@ namespace documentchecker.Controllers
                 foreach (var req in requests)
                 {
                     var requestId = req["id"].ToString();
-                    if (!await _requestStorageService.RequestExistsAsync(requestId))
+                    if (!await requestStorageService.RequestExistsAsync(requestId))
                     {
-                        await _requestStorageService.StoreRequestAsync(req);
+                        await requestStorageService.StoreRequestAsync(req);
                     }
                 }
 
-                Console.WriteLine($"Background sync completed: Fetched {requests.Count} requests");
+                Console.WriteLine($"Background sync completed: {requests.Count} fetched, new records added.");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Background sync error (non-blocking): {ex.Message}");
-                // Error is logged but doesn't propagate - user query continues normally
+                Console.WriteLine($"Background sync error: {ex.Message}");
             }
         }
 
@@ -361,20 +745,19 @@ User query: {userQuery}";
             var outputContent = aiResponse.Choices[0].Message.Content;
             Console.WriteLine($"Raw AI Output: {outputContent}");
 
-            // Clean up markdown formatting if AI wrapped JSON in backticks
             var cleanedContent = outputContent.Trim();
             if (cleanedContent.StartsWith("```json"))
             {
-                cleanedContent = cleanedContent.Substring(7); // Remove ```json
+                cleanedContent = cleanedContent.Substring(7);
             }
             else if (cleanedContent.StartsWith("```"))
             {
-                cleanedContent = cleanedContent.Substring(3); // Remove ```
+                cleanedContent = cleanedContent.Substring(3);
             }
 
             if (cleanedContent.EndsWith("```"))
             {
-                cleanedContent = cleanedContent.Substring(0, cleanedContent.Length - 3); // Remove trailing ```
+                cleanedContent = cleanedContent.Substring(0, cleanedContent.Length - 3);
             }
 
             cleanedContent = cleanedContent.Trim();
