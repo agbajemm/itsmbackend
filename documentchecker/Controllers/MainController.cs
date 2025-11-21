@@ -195,7 +195,7 @@ namespace documentchecker.Controllers
 
                 var rawData = okResult.Value;
                 var conversationalText = await GenerateConversationalResponseAsync(rawData, queryAnalysis, request.Query, conversationContext);
-                var fileName = $"query_result_{DateTime.UtcNow.ToString("yyyyMMdd_HHmmss")}.csv";
+                var fileName = $"queryresult{DateTime.UtcNow.ToString("yyyyMMddHHmmss")}.csv";
                 var url = $"/api/Main/download-result/{sessionId}/{fileName}";
 
                 var finalResponseFull = new
