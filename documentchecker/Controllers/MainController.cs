@@ -1,15 +1,21 @@
 ﻿using Azure;
 using Azure.AI.Agents.Persistent;
 using Azure.Identity;
+using CsvHelper;
+using documentchecker.Controllers;
 using documentchecker.Models;
 using documentchecker.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
+using OfficeOpenXml;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
 using System.Dynamic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
@@ -20,9 +26,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
 using System.Xml.Linq;
-using CsvHelper;
-using OfficeOpenXml;
-using System.IO;
 
 namespace documentchecker.Controllers
 {
@@ -119,24 +122,19 @@ namespace documentchecker.Controllers
             {
                 return BadRequest("Query is required.");
             }
-
             string sessionId = string.IsNullOrEmpty(request.SessionId) ? Guid.NewGuid().ToString() : request.SessionId;
-
             var conversation = await _dbContext.ChatConversations
                 .Include(c => c.Messages)
                 .FirstOrDefaultAsync(c => c.SessionId == sessionId);
-
             if (conversation == null)
             {
                 conversation = new ChatConversation { SessionId = sessionId };
                 _dbContext.ChatConversations.Add(conversation);
             }
-
             if (string.IsNullOrEmpty(conversation.UserEmail) && !string.IsNullOrEmpty(request.UserEmail))
             {
                 conversation.UserEmail = request.UserEmail;
             }
-
             var userMessage = new ChatMessage { Role = "user", Content = request.Query };
             conversation.Messages.Add(userMessage);
             await _dbContext.SaveChangesAsync();
@@ -195,6 +193,7 @@ namespace documentchecker.Controllers
 
                 var rawData = okResult.Value;
                 var conversationalText = await GenerateConversationalResponseAsync(rawData, queryAnalysis, request.Query, conversationContext);
+
                 var fileName = $"queryresult{DateTime.UtcNow.ToString("yyyyMMddHHmmss")}.csv";
                 var url = $"/api/Main/download-result/{sessionId}/{fileName}";
 
@@ -259,6 +258,7 @@ namespace documentchecker.Controllers
 
             var csvFileName = Path.GetFileNameWithoutExtension(fileName) + ".csv";
             var csvBytes = GenerateCsvFromData(dataElement);
+
             return File(csvBytes, "text/csv", csvFileName);
         }
 
@@ -287,24 +287,46 @@ namespace documentchecker.Controllers
             if (conversation?.Messages == null || conversation.Messages.Count <= 1)
                 return "";
 
+            // Exclude the current message and take last 10 messages
             var recentMessages = conversation.Messages
                 .OrderByDescending(m => m.SentAt)
+                .Skip(1) // Skip the current user message
                 .Take(10)
                 .OrderBy(m => m.SentAt)
                 .ToList();
 
-            if (recentMessages.Count <= 1)
+            if (recentMessages.Count == 0)
                 return "";
 
             var sb = new StringBuilder();
-            sb.AppendLine("Previous conversation context:");
-            foreach (var msg in recentMessages.Where(m => m.Role != "agent" || !m.Content.StartsWith("{")))
+            sb.AppendLine("Previous conversation context (most recent first):");
+
+            foreach (var msg in recentMessages)
             {
                 var role = msg.Role == "user" ? "User" : "Assistant";
-                var content = msg.Content.Length > 200 ? msg.Content.Substring(0, 200) + "..." : msg.Content;
-                sb.AppendLine($"  {role}: {content}");
+                var content = msg.Content.Length > 300 ? msg.Content.Substring(0, 300) + "..." : msg.Content;
+
+                // For agent messages, try to extract just the conversational part if it's JSON
+                if (role == "Assistant" && content.StartsWith("{"))
+                {
+                    try
+                    {
+                        var jsonDoc = JsonDocument.Parse(content);
+                        if (jsonDoc.RootElement.TryGetProperty("ConversationalResponse", out var convResp))
+                        {
+                            content = convResp.GetString() ?? content;
+                        }
+                    }
+                    catch
+                    {
+                        // If parsing fails, use original content
+                    }
+                }
+
+                sb.AppendLine($"{role}: {content}");
             }
 
+            sb.AppendLine("\nUse this context to understand references like 'them', 'those', 'the technicians', etc.");
             return sb.ToString();
         }
 
@@ -349,11 +371,9 @@ namespace documentchecker.Controllers
             string currentTime = DateTime.UtcNow.ToString("HH:mm");
 
             var analysisPrompt = $@"You are an AI query analyzer. Analyze the user query and extract structured information.
-
 Current date: {currentDate}
 Current time: {currentTime}
 User Email: {(string.IsNullOrEmpty(userEmail) ? "Unknown" : userEmail)}
-
 {(!string.IsNullOrEmpty(conversationContext) ? $"CONVERSATION CONTEXT:\n{conversationContext}\n\nUse context to understand follow-up questions and maintain continuity.\n" : "")}
 
 Determine the query type and extract parameters. Return ONLY a JSON object with NO explanations or additional text.
@@ -364,6 +384,16 @@ Query types:
 3. 'top_request_areas' - asking for top request subjects/categories
 4. 'top_technicians' - asking for ranking of technicians by requests handled
 5. 'request_search' - searching for specific requests with filters
+
+STATUS FILTERING:
+- Extract status from query: 'open', 'closed', or null for all
+- Keywords: 'open requests', 'closed requests', 'pending', 'resolved', 'completed'
+- Note: 'open' may include 'in progress', 'closed' may include 'resolved' - but set as 'open' or 'closed'
+
+CONVERSATION CONTINUITY:
+- If user refers to previous results (like 'them', 'those', 'the technicians'), maintain context
+- For follow-up questions about previous results, use the same filters and parameters
+- If referring to a list from previous, extract the list (e.g. technician names) from context and set in 'technicians' array
 
 IMPORTANT - Default Date Ranges by Query Type (when user doesn't specify):
 - inactive_technicians: 30 days (unless user specifies inactivityPeriod)
@@ -384,9 +414,11 @@ For time periods, convert to absolute dates:
 - 'last month' = from 1st of last month to last day of last month
 
 PERSONALIZATION RULES:
-- If query mentions ""me"", ""my"", ""mine"" or is about the current user's requests, set a flag in the response
-- If query mentions a specific technician name, extract it to 'technician' field
-- If query is about the requester (user asking about their own requests), leave 'technician' empty
+- If query is about requests the user created/submitted (e.g., 'my requests', 'tickets I opened', 'requests from me'), set isUserRequest: true, isUserTechnician: false
+- If query is about requests assigned to the user as technician (e.g., 'tickets assigned to me', 'my assigned tickets', 'requests treated by me'), set isUserTechnician: true, isUserRequest: false
+- If query mentions a specific technician name (e.g. 'assigned to [name]', 'treated by [name]'), extract it to 'technician' field or 'technicians' array if multiple
+- If query mentions a specific requester name (e.g. 'requests from [name]', 'submitted by [name]'), extract to 'requester' field
+- If context has a list, use 'technicians' array
 
 Response JSON structure:
 {{
@@ -397,25 +429,44 @@ Response JSON structure:
   ""topN"": number or null,
   ""subject"": ""search subject or null"",
   ""technician"": ""technician name or null"",
+  ""technicians"": [array of technician names or null],
+  ""requester"": ""requester name or null"",
   ""inactivityPeriod"": ""X days/weeks/months or null"",
-  ""isUserRequest"": true/false (true if asking about user's own requests)
+  ""isUserRequest"": true/false,
+  ""isUserTechnician"": true/false,
+  ""status"": ""open|closed|null""
 }}
 
+Examples with conversation context:
+Previous: Assistant: Found inactive technicians: tech1, tech2, tech3
+Current: ""how many of them treated requests in the last 1 year""
+Response: {{""queryType"": ""top_technicians"", ""dateFrom"": ""{DateTime.Parse(currentDate).AddYears(-1):yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""technicians"": [""tech1"", ""tech2"", ""tech3""], ""status"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ...}}
+
+Previous: User asked for password reset requests
+Current: ""show me the open ones""
+Response: {{""queryType"": ""request_search"", ""dateFrom"": ""[same as previous]"", ""dateTo"": ""[same as previous]"", ""subject"": ""password reset"", ""status"": ""open"", ...}}
+
 Examples:
-Query: show me my requests
-Response: {{""queryType"": ""request_search"", ""dateFrom"": ""{DateTime.Parse(currentDate).AddDays(-30):yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technician"": null, ""inactivityPeriod"": null, ""isUserRequest"": true}}
+Query: show me my open requests
+Response: {{""queryType"": ""request_search"", ""dateFrom"": ""{DateTime.Parse(currentDate).AddDays(-30):yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": true, ""isUserTechnician"": false, ""status"": ""open""}}
+
+Query: what tickets are assigned to akinola
+Response: {{""queryType"": ""request_search"", ""dateFrom"": ""{DateTime.Parse(currentDate).AddDays(-30):yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technician"": ""akinola"", ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}}
+
+Query: what tickets do i have assigned to me
+Response: {{""queryType"": ""request_search"", ""dateFrom"": ""{DateTime.Parse(currentDate).AddDays(-30):yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": true, ""status"": null}}
 
 Query: technicians inactive for 2 weeks
-Response: {{""queryType"": ""inactive_technicians"", ""dateFrom"": null, ""dateTo"": null, ""inactivityPeriod"": ""14 days"", ""topN"": null, ""subject"": null, ""technician"": null, ""timeUnit"": null, ""isUserRequest"": false}}
+Response: {{""queryType"": ""inactive_technicians"", ""dateFrom"": null, ""dateTo"": null, ""inactivityPeriod"": ""14 days"", ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""timeUnit"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}}
 
 Query: password reset requests from John
-Response: {{""queryType"": ""request_search"", ""dateFrom"": ""{DateTime.Parse(currentDate).AddDays(-30):yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""subject"": ""password reset"", ""technician"": ""John"", ""topN"": null, ""timeUnit"": null, ""inactivityPeriod"": null, ""isUserRequest"": false}}
+Response: {{""queryType"": ""request_search"", ""dateFrom"": ""{DateTime.Parse(currentDate).AddDays(-30):yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""subject"": ""password reset"", ""technician"": null, ""technicians"": null, ""requester"": ""John"", ""topN"": null, ""timeUnit"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}}
 
 Query: top 10 technicians this month
-Response: {{""queryType"": ""top_technicians"", ""dateFrom"": ""{currentDate.Substring(0, 7)}-01 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""topN"": 10, ""subject"": null, ""technician"": null, ""timeUnit"": null, ""inactivityPeriod"": null, ""isUserRequest"": false}}
+Response: {{""queryType"": ""top_technicians"", ""dateFrom"": ""{currentDate.Substring(0, 7)}-01 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""topN"": 10, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""timeUnit"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}}
 
 Query: show influx of requests today by hour
-Response: {{""queryType"": ""influx_requests"", ""dateFrom"": ""{currentDate} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""timeUnit"": ""hour"", ""topN"": null, ""subject"": null, ""technician"": null, ""inactivityPeriod"": null, ""isUserRequest"": false}}
+Response: {{""queryType"": ""influx_requests"", ""dateFrom"": ""{currentDate} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""timeUnit"": ""hour"", ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}}
 
 User query: {userQuery}";
 
@@ -431,8 +482,8 @@ User query: {userQuery}";
 
             var json = JsonSerializer.Serialize(requestBody);
             var content = new StringContent(json, Encoding.UTF8, "application/json");
-            apiClient.DefaultRequestHeaders.Add("api-key", _meAiApiKey);
 
+            apiClient.DefaultRequestHeaders.Add("api-key", _meAiApiKey);
             var response = await apiClient.PostAsync(fullUrl, content);
 
             if (!response.IsSuccessStatusCode)
@@ -457,11 +508,10 @@ User query: {userQuery}";
                 cleanedContent = cleanedContent.Substring(7);
             else if (cleanedContent.StartsWith("```"))
                 cleanedContent = cleanedContent.Substring(3);
-
             if (cleanedContent.EndsWith("```"))
                 cleanedContent = cleanedContent.Substring(0, cleanedContent.Length - 3);
-
             cleanedContent = cleanedContent.Trim();
+
             Console.WriteLine($"Cleaned AI Output: {cleanedContent}");
 
             var analysis = JsonSerializer.Deserialize<QueryAnalysis>(cleanedContent, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
@@ -478,19 +528,41 @@ User query: {userQuery}";
                 var dateTo = DateTimeOffset.UtcNow;
                 var dateFrom = dateTo.AddDays(-daysInactive);
 
-                var allTechnicians = await _dbContext.ManageEngineRequests
-                    .Where(r => !string.IsNullOrEmpty(r.TechnicianName))
-                    .Select(r => r.TechnicianName)
-                    .Distinct()
+                var query = _dbContext.ManageEngineRequests
+                    .Where(r => !string.IsNullOrEmpty(r.TechnicianName));
+
+                if (analysis.Technicians?.Any() ?? false)
+                {
+                    query = query.Where(r => analysis.Technicians.Contains(r.TechnicianName, StringComparer.OrdinalIgnoreCase));
+                }
+
+                if (!string.IsNullOrEmpty(analysis.Technician))
+                {
+                    query = query.Where(r => r.TechnicianName.ToLower().Contains(analysis.Technician.ToLower()));
+                }
+
+                var allTechActivity = await query
+                    .GroupBy(r => r.TechnicianName)
+                    .Select(g => new
+                    {
+                        Technician = g.Key,
+                        LastActivity = g.Max(r => r.CreatedTime),
+                        Requests = g.Select(r => new
+                        {
+                            r.Id,
+                            r.DisplayId,
+                            r.Subject,
+                            r.Status,
+                            r.CreatedTime,
+                            r.RequesterName,
+                            r.RequesterEmail
+                        }).ToList()
+                    })
                     .ToListAsync();
 
-                var activeTechnicians = await _dbContext.ManageEngineRequests
-                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.TechnicianName))
-                    .Select(r => r.TechnicianName)
-                    .Distinct()
-                    .ToListAsync();
-
-                var inactive = allTechnicians.Except(activeTechnicians, StringComparer.OrdinalIgnoreCase).ToList();
+                var inactive = allTechActivity
+                    .Where(a => a.LastActivity < dateFrom)
+                    .ToList();
 
                 return Ok(new
                 {
@@ -499,7 +571,7 @@ User query: {userQuery}";
                     Period = $"From {dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}",
                     InactiveTechnicians = inactive,
                     TotalInactive = inactive.Count,
-                    TotalTechnicians = allTechnicians.Count,
+                    TotalTechnicians = allTechActivity.Count,
                     Timestamp = DateTime.UtcNow
                 });
             }
@@ -515,13 +587,29 @@ User query: {userQuery}";
             {
                 var dateFrom = ParseDateTime(analysis.DateFrom) ?? DateTimeOffset.UtcNow.AddDays(-7).DateTime;
                 var dateTo = ParseDateTime(analysis.DateTo) ?? DateTimeOffset.UtcNow.DateTime;
-
                 var timeUnit = analysis.TimeUnit?.ToLower() ?? "hour";
+
+                var query = _dbContext.ManageEngineRequests
+                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo);
+
+                if (analysis.Technicians?.Any() ?? false)
+                {
+                    query = query.Where(r => analysis.Technicians.Contains(r.TechnicianName, StringComparer.OrdinalIgnoreCase));
+                }
+
+                if (!string.IsNullOrEmpty(analysis.Technician))
+                {
+                    query = query.Where(r => r.TechnicianName.ToLower().Contains(analysis.Technician.ToLower()));
+                }
+
+                if (!string.IsNullOrEmpty(analysis.Requester))
+                {
+                    query = query.Where(r => r.RequesterName.ToLower().Contains(analysis.Requester.ToLower()));
+                }
 
                 if (timeUnit == "hour")
                 {
-                    var allRequests = await _dbContext.ManageEngineRequests
-                        .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo)
+                    var allRequests = await query
                         .Select(r => new { r.CreatedTime })
                         .ToListAsync();
 
@@ -550,8 +638,7 @@ User query: {userQuery}";
                 }
                 else if (timeUnit == "day")
                 {
-                    var allRequests = await _dbContext.ManageEngineRequests
-                        .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo)
+                    var allRequests = await query
                         .Select(r => new { r.CreatedTime })
                         .ToListAsync();
 
@@ -595,13 +682,41 @@ User query: {userQuery}";
                 var dateTo = ParseDateTime(analysis.DateTo) ?? DateTimeOffset.UtcNow.DateTime;
                 var topN = analysis.TopN ?? 10;
 
-                var topAreas = await _dbContext.ManageEngineRequests
-                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.Subject))
+                var query = _dbContext.ManageEngineRequests
+                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.Subject));
+
+                if (analysis.Technicians?.Any() ?? false)
+                {
+                    query = query.Where(r => analysis.Technicians.Contains(r.TechnicianName, StringComparer.OrdinalIgnoreCase));
+                }
+
+                if (!string.IsNullOrEmpty(analysis.Technician))
+                {
+                    query = query.Where(r => r.TechnicianName.ToLower().Contains(analysis.Technician.ToLower()));
+                }
+
+                if (!string.IsNullOrEmpty(analysis.Requester))
+                {
+                    query = query.Where(r => r.RequesterName.ToLower().Contains(analysis.Requester.ToLower()));
+                }
+
+                var topAreas = await query
                     .GroupBy(r => r.Subject)
                     .Select(g => new
                     {
                         Subject = g.Key,
-                        Count = g.Count()
+                        Count = g.Count(),
+                        Requests = g.Select(r => new
+                        {
+                            r.Id,
+                            r.DisplayId,
+                            r.Subject,
+                            r.Status,
+                            r.CreatedTime,
+                            r.RequesterName,
+                            r.RequesterEmail,
+                            r.TechnicianName
+                        }).ToList()
                     })
                     .OrderByDescending(x => x.Count)
                     .Take(topN)
@@ -632,13 +747,42 @@ User query: {userQuery}";
                 var dateTo = ParseDateTime(analysis.DateTo) ?? DateTimeOffset.UtcNow.DateTime;
                 var topN = analysis.TopN ?? 10;
 
-                var topTechs = await _dbContext.ManageEngineRequests
-                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.TechnicianName))
+                var query = _dbContext.ManageEngineRequests
+                    .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo && !string.IsNullOrEmpty(r.TechnicianName));
+
+                if (analysis.Technicians?.Any() ?? false)
+                {
+                    query = query.Where(r => analysis.Technicians.Contains(r.TechnicianName, StringComparer.OrdinalIgnoreCase));
+                }
+
+                if (!string.IsNullOrEmpty(analysis.Technician))
+                {
+                    query = query.Where(r => r.TechnicianName.ToLower().Contains(analysis.Technician.ToLower()));
+                }
+
+                if (!string.IsNullOrEmpty(analysis.Requester))
+                {
+                    query = query.Where(r => r.RequesterName.ToLower().Contains(analysis.Requester.ToLower()));
+                }
+
+                var technicianStats = await query
                     .GroupBy(r => r.TechnicianName)
                     .Select(g => new
                     {
                         Technician = g.Key,
-                        RequestsHandled = g.Count()
+                        RequestsHandled = g.Count(),
+                        OpenRequests = g.Count(r => r.Status == "open" || r.Status == "in progress"),
+                        ClosedRequests = g.Count(r => r.Status == "closed" || r.Status == "resolved"),
+                        AllRequests = g.OrderByDescending(r => r.CreatedTime)
+                                         .Select(r => new {
+                                             r.Id,
+                                             r.DisplayId,
+                                             r.Subject,
+                                             r.Status,
+                                             r.CreatedTime,
+                                             r.RequesterName,
+                                             r.RequesterEmail
+                                         }).ToList()
                     })
                     .OrderByDescending(x => x.RequestsHandled)
                     .Take(topN)
@@ -649,9 +793,9 @@ User query: {userQuery}";
                     QueryType = "TopTechnicians",
                     Period = $"From {dateFrom:yyyy-MM-dd HH:mm} to {dateTo:yyyy-MM-dd HH:mm}",
                     TopN = topN,
-                    TopTechnicians = topTechs,
-                    TotalTechnicians = topTechs.Count,
-                    TotalRequests = topTechs.Sum(x => x.RequestsHandled),
+                    TopTechnicians = technicianStats,
+                    TotalTechnicians = technicianStats.Count,
+                    TotalRequests = technicianStats.Sum(x => x.RequestsHandled),
                     Timestamp = DateTime.UtcNow
                 });
             }
@@ -671,15 +815,45 @@ User query: {userQuery}";
                 var query = _dbContext.ManageEngineRequests
                     .Where(r => r.CreatedTime >= dateFrom && r.CreatedTime <= dateTo);
 
-                // If isUserRequest is true, filter by user's email in JSON data
+                // Status filtering with expanded matching
+                if (!string.IsNullOrEmpty(analysis.Status))
+                {
+                    var statusFilter = analysis.Status.ToLower();
+                    if (statusFilter == "open")
+                    {
+                        query = query.Where(r => r.Status == "open" || r.Status == "in progress" || r.Status == "pending");
+                    }
+                    else if (statusFilter == "closed")
+                    {
+                        query = query.Where(r => r.Status == "closed" || r.Status == "resolved" || r.Status == "completed");
+                    }
+                }
+
+                // Personalization filtering
                 if (analysis.IsUserRequest && !string.IsNullOrEmpty(userEmail))
                 {
-                    query = query.Where(r => r.JsonData.Contains(userEmail));
+                    query = query.Where(r => r.RequesterEmail == userEmail);
                 }
-                // If specific technician requested, filter by technician name
-                else if (!string.IsNullOrEmpty(analysis.Technician))
+                else if (analysis.IsUserTechnician && !string.IsNullOrEmpty(userEmail))
                 {
-                    query = query.Where(r => r.TechnicianName.ToLower().Contains(analysis.Technician.ToLower()));
+                    query = query.Where(r => r.TechnicianEmail == userEmail);
+                }
+                else
+                {
+                    if (analysis.Technicians?.Any() ?? false)
+                    {
+                        query = query.Where(r => analysis.Technicians.Contains(r.TechnicianName, StringComparer.OrdinalIgnoreCase));
+                    }
+
+                    if (!string.IsNullOrEmpty(analysis.Technician))
+                    {
+                        query = query.Where(r => r.TechnicianName.ToLower().Contains(analysis.Technician.ToLower()));
+                    }
+
+                    if (!string.IsNullOrEmpty(analysis.Requester))
+                    {
+                        query = query.Where(r => r.RequesterName.ToLower().Contains(analysis.Requester.ToLower()));
+                    }
                 }
 
                 // Filter by subject if specified
@@ -693,21 +867,61 @@ User query: {userQuery}";
                     .Take(analysis.TopN ?? 50)
                     .ToListAsync();
 
+                // Enhanced response with detailed data
+                var detailedRequests = new List<object>();
+                foreach (var r in requests)
+                {
+                    try
+                    {
+                        var jsonData = JsonSerializer.Deserialize<ManageEngineRequestData>(r.JsonData);
+                        detailedRequests.Add(new
+                        {
+                            r.Id,
+                            DisplayId = jsonData?.DisplayId,
+                            r.Subject,
+                            r.TechnicianName,
+                            r.TechnicianEmail,
+                            r.RequesterName,
+                            r.RequesterEmail,
+                            r.Status,
+                            CreatedTime = r.CreatedTime,
+                            CreatedTimeDisplay = jsonData?.CreatedTime?.DisplayValue,
+                            JsonData = jsonData // Include full JSON for detailed export
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Failed to deserialize request {r.Id}: {ex.Message}");
+                        detailedRequests.Add(new
+                        {
+                            r.Id,
+                            r.DisplayId,
+                            r.Subject,
+                            r.TechnicianName,
+                            r.TechnicianEmail,
+                            r.RequesterName,
+                            r.RequesterEmail,
+                            r.Status,
+                            CreatedTime = r.CreatedTime,
+                            CreatedTimeDisplay = (string)null,
+                            JsonData = (object)null
+                        });
+                    }
+                }
+
                 return Ok(new
                 {
                     QueryType = "RequestSearch",
                     Period = $"From {dateFrom:yyyy-MM-dd HH:mm} to {dateTo:yyyy-MM-dd HH:mm}",
                     Subject = analysis.Subject,
                     Technician = analysis.Technician,
+                    Technicians = analysis.Technicians,
+                    Requester = analysis.Requester,
+                    Status = analysis.Status,
                     IsUserRequest = analysis.IsUserRequest,
-                    RequestsFound = requests.Count,
-                    Requests = requests.Select(r => new
-                    {
-                        r.Id,
-                        r.Subject,
-                        r.TechnicianName,
-                        r.CreatedTime
-                    }),
+                    IsUserTechnician = analysis.IsUserTechnician,
+                    RequestsFound = detailedRequests.Count,
+                    Requests = detailedRequests,
                     Timestamp = DateTime.UtcNow
                 });
             }
@@ -726,6 +940,7 @@ User query: {userQuery}";
             var requests = new List<ManageEngineRequest>();
 
             using var stream = file.OpenReadStream();
+
             if (file.FileName.EndsWith(".csv", StringComparison.OrdinalIgnoreCase))
             {
                 using var reader = new StreamReader(stream);
@@ -754,8 +969,8 @@ User query: {userQuery}";
                 var worksheet = package.Workbook.Worksheets[0];
                 var rowCount = worksheet.Dimension.Rows;
                 var colCount = worksheet.Dimension.Columns;
-
                 var headers = new List<string>();
+
                 for (int col = 1; col <= colCount; col++)
                     headers.Add(worksheet.Cells[1, col].Text);
 
@@ -820,6 +1035,7 @@ User query: {userQuery}";
             };
 
             object searchCriteria = searchCriteriaList;
+
             var allRequests = new List<Dictionary<string, object>>();
             var seenIds = new HashSet<string>();
             bool hasMoreRows = true;
@@ -859,11 +1075,11 @@ User query: {userQuery}";
                             "Zoho-oauthtoken", accessToken);
                         response = await apiClient.GetAsync(url, cts.Token);
                     }
+
                     if (!response.IsSuccessStatusCode)
                     {
                         url = "https://sdpondemand.manageengine.com/api/v3/requests";
                         response = await apiClient.GetAsync(url, cts.Token);
-
                         if (!response.IsSuccessStatusCode)
                         {
                             throw new Exception($"Failed to fetch requests: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
@@ -875,6 +1091,7 @@ User query: {userQuery}";
                 var data = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonResponse) ?? new Dictionary<string, object>();
 
                 var requestsElem = data.ContainsKey("requests") ? (JsonElement)data["requests"] : JsonDocument.Parse("[]").RootElement;
+
                 var currentRequests = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(requestsElem.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new List<Dictionary<string, object>>();
 
                 foreach (var req in currentRequests)
@@ -886,7 +1103,6 @@ User query: {userQuery}";
                 }
 
                 hasMoreRows = false;
-
                 if (data.TryGetValue("list_info", out var listInfoObj) && listInfoObj is JsonElement listInfoElem)
                 {
                     if (listInfoElem.TryGetProperty("has_more_rows", out var hasMoreProp))
@@ -946,8 +1162,8 @@ User query: {userQuery}";
                 }
 
                 string accessToken = accessTokenObj.ToString()!;
-                int expiresIn = 3600;
 
+                int expiresIn = 3600;
                 if (data.TryGetValue("expires_in", out var expiresInObj) && int.TryParse(expiresInObj.ToString(), out int parsedExpiresIn))
                 {
                     expiresIn = parsedExpiresIn;
@@ -973,7 +1189,6 @@ User query: {userQuery}";
                 return (30, 0);
 
             var parts = period.ToLower().Split(' ');
-
             if (parts.Length < 2)
                 return (30, 0);
 
@@ -1006,99 +1221,97 @@ User query: {userQuery}";
             var dataJson = JsonSerializer.Serialize(rawData);
             var data = JsonSerializer.Deserialize<JsonElement>(dataJson);
 
+            string contextInfo = !string.IsNullOrEmpty(conversationContext) ?
+                $"\n[Context from previous conversation has been considered in this response]\n" : "";
+
+            string userRequestNote = analysis.IsUserRequest ? "I've filtered this to show only your submitted requests. " :
+                analysis.IsUserTechnician ? "I've filtered this to show only requests assigned to you as technician. " : "";
+
             string previewText = analysis.QueryType switch
             {
-                "inactive_technicians" => string.Join("\n", data.GetProperty("InactiveTechnicians").EnumerateArray().Take(10).Select(x => "• " + x.GetString())),
-
+                "inactive_technicians" => string.Join("\n", data.GetProperty("InactiveTechnicians").EnumerateArray().Take(10).Select(x => $"• {x.GetProperty("Technician").GetString()} (Last activity: {x.GetProperty("LastActivity").GetDateTimeOffset():yyyy-MM-dd HH:mm})")),
                 "top_request_areas" => string.Join("\n", data.GetProperty("TopAreas").EnumerateArray().Take(10).Select(x => $"• {x.GetProperty("Subject").GetString()}: {x.GetProperty("Count").GetInt32()}")),
-
-                "top_technicians" => string.Join("\n", data.GetProperty("TopTechnicians").EnumerateArray().Take(10).Select(x => $"• {x.GetProperty("Technician").GetString()}: {x.GetProperty("RequestsHandled").GetInt32()} requests")),
-
+                "top_technicians" => string.Join("\n", data.GetProperty("TopTechnicians").EnumerateArray().Take(10).Select((x, i) =>
+                    $"{i + 1}. {x.GetProperty("Technician").GetString()} - {x.GetProperty("RequestsHandled").GetInt32()} requests " +
+                    $"(Open: {x.GetProperty("OpenRequests").GetInt32()}, Closed: {x.GetProperty("ClosedRequests").GetInt32()})")),
                 "influx_requests" when data.TryGetProperty("HourlyData", out var h) => string.Join("\n", h.EnumerateArray().Take(10).Select(x => $"• {x.GetProperty("DateTime").GetDateTime():yyyy-MM-dd HH:00} → {x.GetProperty("Count").GetInt32()} requests")),
-
                 "influx_requests" => string.Join("\n", data.GetProperty("DailyData").EnumerateArray().Take(10).Select(x => $"• {x.GetProperty("Date").GetDateTime():yyyy-MM-dd} → {x.GetProperty("Count").GetInt32()} requests")),
-
                 "request_search" => string.Join("\n", data.GetProperty("Requests").EnumerateArray().Take(10).Select(r =>
-                    $"• #{r.GetProperty("Id").GetString()} | {r.GetProperty("Subject").GetString()} | {r.GetProperty("TechnicianName").GetString() ?? "Unassigned"} | {r.GetProperty("CreatedTime").GetDateTime():yyyy-MM-dd HH:mm}")),
-
+                    $"• #{r.GetProperty("Id").GetString()} | {r.GetProperty("Subject").GetString()} | {r.GetProperty("TechnicianName").GetString() ?? "Unassigned"} | {r.GetProperty("Status").GetString()} | {r.GetProperty("CreatedTime").GetDateTime():yyyy-MM-dd HH:mm}")),
                 _ => ""
             };
-
-            string contextInfo = !string.IsNullOrEmpty(conversationContext) ? $"Based on our conversation:\n{conversationContext}\n" : "";
-
-            string userRequestNote = analysis.IsUserRequest ? "Note: This is filtering for the user's own requests.\n" : "";
 
             string prompt = analysis.QueryType switch
             {
                 "inactive_technicians" => $"""
-                You are a friendly IT service desk assistant helping manage technician performance.
+                You are a friendly IT service desk assistant.
                 {contextInfo}
                 {userRequestNote}
                 User asked: "{userQuery}"
-
-                Inactive technicians (first 10 shown):
-                {previewText}
-
-                Total inactive: {data.GetProperty("TotalInactive").GetInt32()} out of {data.GetProperty("TotalTechnicians").GetInt32()}
+               
+                Found {data.GetProperty("TotalInactive").GetInt32()} inactive technicians out of {data.GetProperty("TotalTechnicians").GetInt32()} total.
                 Period: {data.GetProperty("Period").GetString()}
-
-                Respond in 2–4 warm, natural sentences. Be helpful and professional. Always explicitly list the first 10 inactive technicians in your response using bullet points.
+               
+                Inactive technicians:
+                {previewText}
+               
+                Respond in 2-4 warm, natural sentences. Explain what inactive means (no requests handled in the period).
+                If this is a follow-up question, acknowledge the continuity from previous conversation.
+                Always explicitly list the first 10 inactive technicians in your response using bullet points.
                 """,
-
                 "influx_requests" => $"""
                 You are a helpful IT analytics assistant tracking request patterns.
                 {contextInfo}
                 {userRequestNote}
                 User asked: "{userQuery}"
-
                 Request influx ({(data.TryGetProperty("TimeUnit", out var tu) ? tu.GetString() : "period")} view):
                 {previewText}
-
                 Peak: {(data.TryGetProperty("PeakHour", out var ph) ? $"{ph.GetProperty("DateTime").GetDateTime():yyyy-MM-dd HH:00} ({ph.GetProperty("Count").GetInt32()} requests)" :
                           data.TryGetProperty("PeakDay", out var pd) ? $"{pd.GetProperty("Date").GetDateTime():yyyy-MM-dd} ({pd.GetProperty("Count").GetInt32()} requests)" : "N/A")}
-
                 Total requests: {data.GetProperty("TotalRequests").GetInt32()}
-
-                Give a short, conversational summary highlighting the busiest time and patterns. Always explicitly list the first 10 items in your response using bullet points.
+                Give a short, conversational summary highlighting the busiest time and patterns.
+                If this continues from previous conversation, acknowledge that.
+                Always explicitly list the first 10 items in your response using bullet points.
                 """,
-
                 "top_request_areas" => $"""
                 You are a helpful IT service desk analyst.
                 {contextInfo}
                 {userRequestNote}
                 User asked: "{userQuery}"
-
                 Top request categories (top 10 shown):
                 {previewText}
-
-                Respond naturally: mention the #1 area and maybe #2–3. Sound helpful and insightful about what we're dealing with. Always explicitly list the first 10 categories in your response using bullet points.
+                Respond naturally: mention the #1 area and maybe #2–3. Sound helpful and insightful about what we're dealing with.
+                If continuing from previous chat, maintain context.
+                Always explicitly list the first 10 categories in your response using bullet points.
                 """,
-
                 "top_technicians" => $"""
                 You are a supportive IT team manager recognizing top performers.
                 {contextInfo}
                 {userRequestNote}
                 User asked: "{userQuery}"
-
                 Top performing technicians (top 10 shown):
                 {previewText}
-
-                Respond in a congratulatory, friendly tone. Shout out the top 1–3 performers and thank the team for their hard work. Always explicitly list the first 10 technicians in your response using bullet points.
+                Period: {data.GetProperty("Period").GetString()}
+               
+                Respond in a congratulatory, friendly tone. Shout out the top 1–3 performers and thank the team for their hard work.
+                If this compares to previous inactive technicians, note the contrast.
+                Always explicitly list the first 10 technicians in your response using bullet points.
                 """,
-
                 "request_search" => $"""
                 You are a helpful IT service desk assistant.
                 {contextInfo}
                 {userRequestNote}
                 User searched: "{userQuery}"
-
                 Found {data.GetProperty("RequestsFound").GetInt32()} matching requests. First 10:
                 {previewText}
-
-                Respond naturally: confirm the search, highlight anything interesting, and mention the full list is available in Excel. Always explicitly list the first 10 requests in your response using bullet points.
+                Status filter: {(string.IsNullOrEmpty(analysis.Status) ? "All" : analysis.Status)}
+                Period: {data.GetProperty("Period").GetString()}
+               
+                Respond naturally: confirm the search, highlight anything interesting, and mention the full list is available in Excel.
+                If continuing previous search, acknowledge the refinement.
+                Always explicitly list the first 10 requests in your response using bullet points.
                 """,
-
-                _ => "Here's the information you requested!"
+                _ => $"Here's the information you requested!{contextInfo}"
             };
 
             return await CallMeAiForTextAsync(prompt);
@@ -1113,7 +1326,7 @@ User query: {userQuery}";
             {
                 messages = new[] { new { role = "user", content = prompt } },
                 max_tokens = 500,
-                temperature = 0.7
+                temperature = 0.1
             };
 
             var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
@@ -1137,13 +1350,12 @@ User query: {userQuery}";
             if (data.TryGetProperty("QueryType", out var qt))
             {
                 var type = qt.GetString();
-
                 switch (type)
                 {
                     case "InactiveTechnicians":
-                        sb.AppendLine("Inactive Technician");
+                        sb.AppendLine("Technician,Last Activity");
                         foreach (var tech in data.GetProperty("InactiveTechnicians").EnumerateArray())
-                            sb.AppendLine($"\"{Safe(tech.GetString())}\"");
+                            sb.AppendLine($"\"{Safe(tech.GetProperty("Technician").GetString())}\",\"{tech.GetProperty("LastActivity").GetDateTimeOffset():yyyy-MM-dd HH:mm}\"");
                         break;
 
                     case "TopRequestAreas":
@@ -1153,9 +1365,11 @@ User query: {userQuery}";
                         break;
 
                     case "TopTechnicians":
-                        sb.AppendLine("Technician,Requests Handled");
+                        sb.AppendLine("Technician,Total Requests,Open Requests,Closed Requests");
                         foreach (var item in data.GetProperty("TopTechnicians").EnumerateArray())
-                            sb.AppendLine($"\"{Safe(item.GetProperty("Technician").GetString())}\",\"{item.GetProperty("RequestsHandled").GetInt32()}\"");
+                        {
+                            sb.AppendLine($"\"{Safe(item.GetProperty("Technician").GetString())}\",\"{item.GetProperty("RequestsHandled").GetInt32()}\",\"{item.GetProperty("OpenRequests").GetInt32()}\",\"{item.GetProperty("ClosedRequests").GetInt32()}\"");
+                        }
                         break;
 
                     case "InfluxRequests":
@@ -1174,11 +1388,16 @@ User query: {userQuery}";
                         break;
 
                     case "RequestSearch":
-                        sb.AppendLine("ID,Subject,Technician,Created Time");
+                        sb.AppendLine("ID,Display ID,Subject,Technician,Technician Email,Requester,Requester Email,Status,Created Time");
                         foreach (var r in data.GetProperty("Requests").EnumerateArray())
                         {
+                            var displayId = r.TryGetProperty("DisplayId", out var d) ? d.GetString() : "";
                             var tech = r.TryGetProperty("TechnicianName", out var t) ? t.GetString() : "";
-                            sb.AppendLine($"\"{r.GetProperty("Id").GetString()}\",\"{Safe(r.GetProperty("Subject").GetString())}\",\"{Safe(tech)}\",\"{r.GetProperty("CreatedTime").GetDateTime():yyyy-MM-dd HH:mm}\"");
+                            var techEmail = r.TryGetProperty("TechnicianEmail", out var te) ? te.GetString() : "";
+                            var requester = r.TryGetProperty("RequesterName", out var req) ? req.GetString() : "";
+                            var requesterEmail = r.TryGetProperty("RequesterEmail", out var email) ? email.GetString() : "";
+                            var status = r.TryGetProperty("Status", out var s) ? s.GetString() : "";
+                            sb.AppendLine($"\"{r.GetProperty("Id").GetString()}\",\"{Safe(displayId)}\",\"{Safe(r.GetProperty("Subject").GetString())}\",\"{Safe(tech)}\",\"{Safe(techEmail)}\",\"{Safe(requester)}\",\"{Safe(requesterEmail)}\",\"{Safe(status)}\",\"{r.GetProperty("CreatedTime").GetDateTime():yyyy-MM-dd HH:mm}\"");
                         }
                         break;
 
@@ -1193,7 +1412,6 @@ User query: {userQuery}";
     }
 
     // Helper Classes
-
     public class NaturalQueryRequest
     {
         public string Query { get; set; }
@@ -1224,11 +1442,23 @@ User query: {userQuery}";
         [JsonPropertyName("technician")]
         public string Technician { get; set; }
 
+        [JsonPropertyName("technicians")]
+        public List<string> Technicians { get; set; }
+
+        [JsonPropertyName("requester")]
+        public string Requester { get; set; }
+
         [JsonPropertyName("inactivityPeriod")]
         public string InactivityPeriod { get; set; }
 
         [JsonPropertyName("isUserRequest")]
         public bool IsUserRequest { get; set; }
+
+        [JsonPropertyName("isUserTechnician")]
+        public bool IsUserTechnician { get; set; }
+
+        [JsonPropertyName("status")]
+        public string Status { get; set; } // "open", "closed", or null for all
     }
 
     public class AiResponse
@@ -1247,5 +1477,63 @@ User query: {userQuery}";
     {
         [JsonPropertyName("content")]
         public string Content { get; set; }
+    }
+
+    // Enhanced data models for JSON parsing
+    public class ManageEngineRequestData
+    {
+        [JsonPropertyName("status")]
+        public StatusInfo Status { get; set; }
+
+        [JsonPropertyName("requester")]
+        public RequesterInfo Requester { get; set; }
+
+        [JsonPropertyName("technician")]
+        public TechnicianInfo Technician { get; set; }
+
+        [JsonPropertyName("subject")]
+        public string Subject { get; set; }
+
+        [JsonPropertyName("created_time")]
+        public TimeInfo CreatedTime { get; set; }
+
+        [JsonPropertyName("display_id")]
+        public string DisplayId { get; set; }
+    }
+
+    public class StatusInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+
+        [JsonPropertyName("internal_name")]
+        public string InternalName { get; set; }
+    }
+
+    public class RequesterInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+
+        [JsonPropertyName("email_id")]
+        public string EmailId { get; set; }
+    }
+
+    public class TechnicianInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+
+        [JsonPropertyName("email_id")]
+        public string EmailId { get; set; }
+    }
+
+    public class TimeInfo
+    {
+        [JsonPropertyName("value")]
+        public string Value { get; set; }  // Changed to string for flexibility
+
+        [JsonPropertyName("display_value")]
+        public string DisplayValue { get; set; }
     }
 }
