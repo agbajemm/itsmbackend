@@ -6,6 +6,7 @@ namespace documentchecker.Models
     {
         public int Id { get; set; }
         public string SessionId { get; set; } = Guid.NewGuid().ToString();
+        public string? ThreadId { get; set; } // Azure AI Foundry thread id for persistent context
         public DateTime StartedAt { get; set; } = DateTime.UtcNow;
         public DateTime? EndedAt { get; set; }
         public string? UserEmail { get; set; }
