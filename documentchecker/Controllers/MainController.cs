@@ -1270,7 +1270,7 @@ Generate a friendly, conversational response:";
                     tech.LastActivity,
                     tech.TotalRequests,
                     DaysInactive = (int)(dateTo - tech.LastActivity).TotalDays,
-                    Requests = techRequests.Select(r => ParseRequestDetails(r.JsonData, r)).ToList()
+                    Requests = techRequests.Select(r => ParseRequestDetailsFromFlatJson(r.JsonData, r)).ToList()
                 });
             }
 
@@ -1340,7 +1340,7 @@ Generate a friendly, conversational response:";
                     {
                         hourGroup.DateTime,
                         hourGroup.Count,
-                        Requests = hourGroup.RequestIds.Select(r => ParseRequestDetails(r.JsonData, new
+                        Requests = hourGroup.RequestIds.Select(r => ParseRequestDetailsFromFlatJson(r.JsonData, new
                         {
                             Id = r.Id,
                             DisplayId = r.DisplayId,
@@ -1388,7 +1388,7 @@ Generate a friendly, conversational response:";
                     {
                         dayGroup.Date,
                         dayGroup.Count,
-                        Requests = dayGroup.RequestIds.Select(r => ParseRequestDetails(r.JsonData, new
+                        Requests = dayGroup.RequestIds.Select(r => ParseRequestDetailsFromFlatJson(r.JsonData, new
                         {
                             Id = r.Id,
                             DisplayId = r.DisplayId,
@@ -1483,7 +1483,7 @@ Generate a friendly, conversational response:";
                 {
                     area.Subject,
                     area.Count,
-                    Requests = areaRequests.Select(r => ParseRequestDetails(r.JsonData, r)).ToList()
+                    Requests = areaRequests.Select(r => ParseRequestDetailsFromFlatJson(r.JsonData, r)).ToList()
                 });
             }
 
@@ -1568,15 +1568,16 @@ Generate a friendly, conversational response:";
                     })
                     .ToListAsync();
 
-                var parsedRequests = techRequests.Select(r => ParseRequestDetails(r.JsonData, r)).ToList();
+                var parsedRequests = techRequests.Select(r => ParseRequestDetailsFromFlatJson(r.JsonData, r)).ToList();
 
                 detailedStats.Add(new
                 {
                     tech.Technician,
                     tech.TechnicianEmail,
                     tech.RequestsHandled,
-                    OpenRequests = parsedRequests.Count(r => IsOpenStatus(r.StatusInternal)),
-                    ClosedRequests = parsedRequests.Count(r => IsClosedStatus(r.StatusInternal)),
+                    // Updated: use dictionary access for status check
+                    OpenRequests = parsedRequests.Count(r => IsOpenStatus(r.TryGetValue("Status", out var s) ? s?.ToString() : "")),
+                    ClosedRequests = parsedRequests.Count(r => IsClosedStatus(r.TryGetValue("Status", out var s) ? s?.ToString() : "")),
                     Requests = parsedRequests
                 });
             }
@@ -1698,7 +1699,7 @@ Generate a friendly, conversational response:";
                 }).ToList();
             }
 
-            var detailedRequests = requests.Select(r => ParseRequestDetails(r.JsonData, r)).ToList();
+            var detailedRequests = requests.Select(r => ParseRequestDetailsFromFlatJson(r.JsonData, r)).ToList();
 
             return new
             {
@@ -1729,9 +1730,9 @@ Generate a friendly, conversational response:";
                     r.Status.ToLower() == "in progress" ||
                     r.Status.ToLower() == "pending" ||
                     r.Status.ToLower().Contains("open") ||
-                    r.JsonData.Contains("\"internal_name\":\"Open\"") ||
-                    r.JsonData.Contains("\"internal_name\":\"In Progress\"") ||
-                    r.JsonData.Contains("\"internal_name\":\"Pending\"")
+                    r.JsonData.Contains("\"Status\":\"Open\"") ||
+                    r.JsonData.Contains("\"Status\":\"In Progress\"") ||
+                    r.JsonData.Contains("\"Status\":\"Pending\"")
                 );
             }
             else if (lowerStatus == "closed")
@@ -1741,9 +1742,9 @@ Generate a friendly, conversational response:";
                     r.Status.ToLower() == "resolved" ||
                     r.Status.ToLower() == "completed" ||
                     r.Status.ToLower().Contains("closed") ||
-                    r.JsonData.Contains("\"internal_name\":\"Closed\"") ||
-                    r.JsonData.Contains("\"internal_name\":\"Resolved\"") ||
-                    r.JsonData.Contains("\"internal_name\":\"Completed\"")
+                    r.JsonData.Contains("\"Status\":\"Closed\"") ||
+                    r.JsonData.Contains("\"Status\":\"Resolved\"") ||
+                    r.JsonData.Contains("\"Status\":\"Completed\"")
                 );
             }
 
@@ -1762,161 +1763,6 @@ Generate a friendly, conversational response:";
             if (string.IsNullOrEmpty(internalStatus)) return false;
             var lower = internalStatus.ToLower();
             return lower == "closed" || lower == "resolved" || lower == "completed" || lower.Contains("closed");
-        }
-
-        /// <summary>
-        /// Parse request details from JSON data - COMPREHENSIVE version with all fields
-        /// </summary>
-        private dynamic ParseRequestDetails(string jsonData, dynamic basicRequest)
-        {
-            try
-            {
-                var data = JsonSerializer.Deserialize<ManageEngineRequestData>(jsonData, new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                });
-
-                // Strip HTML from description
-                string StripHtml(string html)
-                {
-                    if (string.IsNullOrEmpty(html)) return "";
-                    return System.Text.RegularExpressions.Regex.Replace(html, "<[^>]*>", " ")
-                        .Replace("&nbsp;", " ")
-                        .Replace("&amp;", "&")
-                        .Replace("&lt;", "<")
-                        .Replace("&gt;", ">")
-                        .Replace("  ", " ")
-                        .Trim();
-                }
-
-                return new
-                {
-                    // Core fields
-                    Id = basicRequest.Id?.ToString() ?? "",
-                    DisplayId = data?.DisplayId ?? basicRequest.DisplayId?.ToString() ?? "",
-                    Subject = data?.Subject ?? basicRequest.Subject?.ToString() ?? "",
-                    Description = StripHtml(data?.Description ?? ""),
-
-                    // Status
-                    Status = data?.Status?.Name ?? basicRequest.Status?.ToString() ?? "",
-                    StatusInternal = data?.Status?.InternalName ?? "",
-                    StatusColor = data?.Status?.Color ?? "",
-
-                    // Technician
-                    TechnicianName = data?.Technician?.Name ?? basicRequest.TechnicianName?.ToString() ?? "",
-                    TechnicianEmail = data?.Technician?.EmailId ?? "",
-
-                    // Requester - COMPREHENSIVE
-                    RequesterName = data?.Requester?.Name ?? basicRequest.RequesterName?.ToString() ?? "",
-                    RequesterEmail = data?.Requester?.EmailId ?? basicRequest.RequesterEmail?.ToString() ?? "",
-                    RequesterPhone = data?.Requester?.Phone ?? "",
-                    RequesterMobile = data?.Requester?.Mobile ?? "",
-                    RequesterDepartment = data?.Requester?.Department?.Name ?? "",
-                    RequesterSite = data?.Requester?.Site?.Name ?? "",
-                    RequesterJobTitle = data?.Requester?.JobTitle ?? "",
-                    RequesterEmployeeId = data?.Requester?.EmployeeId ?? "",
-
-                    // Timestamps - COMPREHENSIVE
-                    CreatedTime = basicRequest.CreatedTime,
-                    CreatedTimeDisplay = data?.CreatedTime?.DisplayValue ?? basicRequest.CreatedTime?.ToString() ?? "",
-                    DueByTime = data?.DueByTime?.DisplayValue ?? "",
-                    RespondedDate = data?.RespondedTime?.DisplayValue ?? "",
-                    CompletedDate = data?.CompletedTime?.DisplayValue ?? "",
-                    ResolvedTime = data?.ResolvedTime?.DisplayValue ?? "",
-                    LastUpdatedTime = data?.LastUpdatedTime?.DisplayValue ?? "",
-
-                    // Classification - COMPREHENSIVE
-                    Category = data?.Category?.Name ?? "",
-                    Subcategory = data?.Subcategory?.Name ?? "",
-                    Item = data?.Item?.Name ?? "",
-                    Priority = data?.Priority?.Name ?? "",
-                    Urgency = data?.Urgency?.Name ?? "",
-                    Impact = data?.Impact?.Name ?? "",
-                    RequestType = data?.RequestType?.Name ?? "",
-                    Level = data?.Level?.Name ?? "",
-                    Mode = data?.Mode?.Name ?? "",
-
-                    // Assignment
-                    Group = data?.Group?.Name ?? "",
-                    Template = data?.Template?.Name ?? "",
-                    Site = data?.Site?.Name ?? "",
-                    Department = data?.Department?.Name ?? "",
-
-                    // Flags
-                    IsServiceRequest = data?.IsServiceRequest ?? false,
-                    HasNotes = data?.HasNotes ?? false,
-                    IsOverdue = data?.IsOverdue ?? false,
-                    IsResponseOverdue = data?.IsFirstResponseOverdue ?? false,
-
-                    // Resolution
-                    Resolution = data?.Resolution?.Content ?? "",
-                    ResolutionSubmittedBy = data?.Resolution?.SubmittedBy ?? "",
-                    ResolutionTime = data?.Resolution?.SubmittedOn?.DisplayValue ?? "",
-
-                    // Audit
-                    CreatedBy = data?.CreatedBy?.Name ?? "",
-                    LastUpdatedBy = data?.LastUpdatedBy?.Name ?? "",
-                    OnBehalfOf = data?.OnBehalfOf?.Name ?? "",
-
-                    // Store full data for any additional fields
-                    FullData = data
-                };
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error parsing request {basicRequest.Id}: {ex.Message}");
-                return new
-                {
-                    Id = basicRequest.Id?.ToString() ?? "",
-                    DisplayId = basicRequest.DisplayId?.ToString() ?? "",
-                    Subject = basicRequest.Subject?.ToString() ?? "",
-                    Description = "",
-                    Status = basicRequest.Status?.ToString() ?? "",
-                    StatusInternal = "",
-                    StatusColor = "",
-                    TechnicianName = basicRequest.TechnicianName?.ToString() ?? "",
-                    TechnicianEmail = "",
-                    RequesterName = basicRequest.RequesterName?.ToString() ?? "",
-                    RequesterEmail = basicRequest.RequesterEmail?.ToString() ?? "",
-                    RequesterPhone = "",
-                    RequesterMobile = "",
-                    RequesterDepartment = "",
-                    RequesterSite = "",
-                    RequesterJobTitle = "",
-                    RequesterEmployeeId = "",
-                    CreatedTime = basicRequest.CreatedTime,
-                    CreatedTimeDisplay = basicRequest.CreatedTime?.ToString() ?? "",
-                    DueByTime = "",
-                    RespondedDate = "",
-                    CompletedDate = "",
-                    ResolvedTime = "",
-                    LastUpdatedTime = "",
-                    Category = "",
-                    Subcategory = "",
-                    Item = "",
-                    Priority = "",
-                    Urgency = "",
-                    Impact = "",
-                    RequestType = "",
-                    Level = "",
-                    Mode = "",
-                    Group = "",
-                    Template = "",
-                    Site = "",
-                    Department = "",
-                    IsServiceRequest = false,
-                    HasNotes = false,
-                    IsOverdue = false,
-                    IsResponseOverdue = false,
-                    Resolution = "",
-                    ResolutionSubmittedBy = "",
-                    ResolutionTime = "",
-                    CreatedBy = "",
-                    LastUpdatedBy = "",
-                    OnBehalfOf = "",
-                    FullData = (object)null
-                };
-            }
         }
 
         private string GenerateDataSummary(object data, QueryAnalysis analysis)
@@ -2086,7 +1932,7 @@ Generate a friendly, conversational response:";
                 return NotFound("Data not found.");
 
             var csvFileName = Path.GetFileNameWithoutExtension(fileName) + ".csv";
-            var csvBytes = GenerateEnhancedCsvFromData(dataElement);
+            var csvBytes = GenerateDynamicCsvFromData(dataElement);
 
             return File(csvBytes, "text/csv", csvFileName);
         }
@@ -2435,73 +2281,184 @@ Generate a friendly, conversational response:";
             return null;
         }
 
-        /// <summary>
-        /// Generate COMPREHENSIVE CSV with all fields from data
-        /// </summary>
-        private byte[] GenerateEnhancedCsvFromData(JsonElement data)
+        private Dictionary<string, object> ParseRequestDetailsFromFlatJson(string jsonData, dynamic basicRequest)
         {
-            var sb = new StringBuilder();
-            string Safe(object? value) => value?.ToString()?.Replace("\"", "\"\"").Replace("\n", " ").Replace("\r", "") ?? "";
+            var result = new Dictionary<string, object>();
+
+            // Strip HTML from description
+            string StripHtml(string html)
+            {
+                if (string.IsNullOrEmpty(html)) return "";
+                return System.Text.RegularExpressions.Regex.Replace(html, "<[^>]*>", " ")
+                    .Replace("&nbsp;", " ")
+                    .Replace("&amp;", "&")
+                    .Replace("&lt;", "<")
+                    .Replace("&gt;", ">")
+                    .Replace("  ", " ")
+                    .Trim();
+            }
+
+            try
+            {
+                if (!string.IsNullOrEmpty(jsonData))
+                {
+                    // Parse the flat JSON structure
+                    var jsonDoc = JsonDocument.Parse(jsonData);
+                    var root = jsonDoc.RootElement;
+
+                    foreach (var property in root.EnumerateObject())
+                    {
+                        var key = property.Name;
+                        var value = property.Value;
+
+                        // Get the value based on type
+                        object parsedValue = value.ValueKind switch
+                        {
+                            JsonValueKind.String => value.GetString() ?? "",
+                            JsonValueKind.Number => value.TryGetInt64(out var l) ? l : value.GetDouble(),
+                            JsonValueKind.True => true,
+                            JsonValueKind.False => false,
+                            JsonValueKind.Null => "",
+                            _ => value.GetRawText()
+                        };
+
+                        // Special handling for Description - strip HTML
+                        if (key.Equals("Description", StringComparison.OrdinalIgnoreCase))
+                        {
+                            parsedValue = StripHtml(parsedValue?.ToString() ?? "");
+                        }
+
+                        // Handle "-" as empty
+                        if (parsedValue?.ToString() == "-")
+                        {
+                            parsedValue = "";
+                        }
+
+                        result[key] = parsedValue;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error parsing flat JSON for request {basicRequest?.Id}: {ex.Message}");
+            }
+
+            // Add basic request fields if not present from JSON
+            if (!result.ContainsKey("Id") && basicRequest?.Id != null)
+                result["Id"] = basicRequest.Id?.ToString() ?? "";
+            if (!result.ContainsKey("DisplayId") && basicRequest?.DisplayId != null)
+                result["DisplayId"] = basicRequest.DisplayId?.ToString() ?? "";
+            if (!result.ContainsKey("Subject") && basicRequest?.Subject != null)
+                result["Subject"] = basicRequest.Subject?.ToString() ?? "";
+            if (!result.ContainsKey("Status") && basicRequest?.Status != null)
+                result["Status"] = basicRequest.Status?.ToString() ?? "";
+            if (!result.ContainsKey("TechnicianName") && basicRequest?.TechnicianName != null)
+                result["Technician"] = basicRequest.TechnicianName?.ToString() ?? "";
+            if (!result.ContainsKey("RequesterName") && basicRequest?.RequesterName != null)
+                result["Requester Name"] = basicRequest.RequesterName?.ToString() ?? "";
+            if (!result.ContainsKey("CreatedTime") && basicRequest?.CreatedTime != null)
+            {
+                try
+                {
+                    result["Created Date"] = ((DateTime)basicRequest.CreatedTime).ToString("yyyy-MM-dd HH:mm:ss");
+                }
+                catch { }
+            }
+
+            return result;
+        }
+
+        private byte[] GenerateDynamicCsvFromData(JsonElement data)
+        {
+            string Safe(object? value)
+            {
+                var str = value?.ToString() ?? "";
+                // Handle "-" as empty
+                if (str == "-") return "";
+                return str.Replace("\"", "\"\"").Replace("\n", " ").Replace("\r", "");
+            }
+
+            bool HasValue(object? value)
+            {
+                if (value == null) return false;
+                var str = value.ToString() ?? "";
+                return !string.IsNullOrWhiteSpace(str) && str != "-" && str != "false" && str != "0";
+            }
 
             if (data.TryGetProperty("QueryType", out var qt))
             {
                 var type = qt.GetString();
 
+                if (type == "Conversational")
+                {
+                    var sb = new StringBuilder();
+                    sb.AppendLine("Type,Intent,Timestamp");
+                    sb.AppendLine($"\"Conversational\",\"{Safe(data.TryGetProperty("Intent", out var intent) ? intent.GetString() : "")}\",\"{Safe(data.TryGetProperty("Timestamp", out var ts) ? ts.GetString() : "")}\"");
+                    return Encoding.UTF8.GetBytes(sb.ToString());
+                }
+
+                // Collect all requests from different query types
+                var allRequests = new List<Dictionary<string, object>>();
+                var prefixColumns = new List<string>(); // Extra columns to add at the beginning
+
                 switch (type)
                 {
-                    case "Conversational":
-                        sb.AppendLine("Type,Intent,Timestamp");
-                        sb.AppendLine($"\"Conversational\",\"{Safe(data.TryGetProperty("Intent", out var intent) ? intent.GetString() : "")}\",\"{Safe(data.TryGetProperty("Timestamp", out var ts) ? ts.GetString() : "")}\"");
-                        break;
-
                     case "InactiveTechnicians":
-                        sb.AppendLine("Technician,Email,Last Activity,Days Inactive,Total Requests,Request ID,Display ID,Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
+                        prefixColumns.AddRange(new[] { "Technician (Inactive)", "Days Inactive", "Total Requests" });
                         foreach (var tech in data.GetProperty("InactiveTechnicians").EnumerateArray())
                         {
-                            var techName = Safe(tech.GetProperty("Technician").GetString());
-                            var techEmail = Safe(tech.TryGetProperty("TechnicianEmail", out var te) ? te.GetString() : "");
-                            var lastActivity = tech.GetProperty("LastActivity").GetDateTime().ToString("yyyy-MM-dd HH:mm");
+                            var techName = tech.GetProperty("Technician").GetString() ?? "";
                             var daysInactive = tech.GetProperty("DaysInactive").GetInt32();
                             var totalReqs = tech.GetProperty("TotalRequests").GetInt32();
 
                             foreach (var req in tech.GetProperty("Requests").EnumerateArray())
                             {
-                                sb.AppendLine($"\"{techName}\",\"{techEmail}\",\"{lastActivity}\",\"{daysInactive}\",\"{totalReqs}\"," +
-                                    BuildRequestCsvLine(req));
+                                var reqDict = JsonElementToDictionary(req);
+                                reqDict["Technician (Inactive)"] = techName;
+                                reqDict["Days Inactive"] = daysInactive;
+                                reqDict["Total Requests"] = totalReqs;
+                                allRequests.Add(reqDict);
                             }
                         }
                         break;
 
                     case "TopTechnicians":
-                        sb.AppendLine("Rank,Technician,Email,Total Requests,Open Requests,Closed Requests,Request ID,Display ID,Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
+                        prefixColumns.AddRange(new[] { "Rank", "Technician (Top)", "Requests Handled", "Open Requests", "Closed Requests" });
                         int rank = 1;
                         foreach (var tech in data.GetProperty("TopTechnicians").EnumerateArray())
                         {
-                            var techName = Safe(tech.GetProperty("Technician").GetString());
-                            var techEmail = Safe(tech.TryGetProperty("TechnicianEmail", out var te) ? te.GetString() : "");
-                            var totalReqs = tech.GetProperty("RequestsHandled").GetInt32();
-                            var openReqs = tech.GetProperty("OpenRequests").GetInt32();
-                            var closedReqs = tech.GetProperty("ClosedRequests").GetInt32();
+                            var techName = tech.GetProperty("Technician").GetString() ?? "";
+                            var handled = tech.GetProperty("RequestsHandled").GetInt32();
+                            var open = tech.GetProperty("OpenRequests").GetInt32();
+                            var closed = tech.GetProperty("ClosedRequests").GetInt32();
 
                             foreach (var req in tech.GetProperty("Requests").EnumerateArray())
                             {
-                                sb.AppendLine($"\"{rank}\",\"{techName}\",\"{techEmail}\",\"{totalReqs}\",\"{openReqs}\",\"{closedReqs}\"," +
-                                    BuildRequestCsvLine(req));
+                                var reqDict = JsonElementToDictionary(req);
+                                reqDict["Rank"] = rank;
+                                reqDict["Technician (Top)"] = techName;
+                                reqDict["Requests Handled"] = handled;
+                                reqDict["Open Requests"] = open;
+                                reqDict["Closed Requests"] = closed;
+                                allRequests.Add(reqDict);
                             }
                             rank++;
                         }
                         break;
 
                     case "TopRequestAreas":
-                        sb.AppendLine("Subject Area,Total Count,Request ID,Display ID,Request Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Technician,Technician Email,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
+                        prefixColumns.AddRange(new[] { "Subject Area", "Area Count" });
                         foreach (var area in data.GetProperty("TopAreas").EnumerateArray())
                         {
-                            var subject = Safe(area.GetProperty("Subject").GetString());
+                            var subject = area.GetProperty("Subject").GetString() ?? "";
                             var count = area.GetProperty("Count").GetInt32();
 
                             foreach (var req in area.GetProperty("Requests").EnumerateArray())
                             {
-                                sb.AppendLine($"\"{subject}\",\"{count}\"," + BuildRequestCsvLine(req));
+                                var reqDict = JsonElementToDictionary(req);
+                                reqDict["Subject Area"] = subject;
+                                reqDict["Area Count"] = count;
+                                allRequests.Add(reqDict);
                             }
                         }
                         break;
@@ -2509,7 +2466,7 @@ Generate a friendly, conversational response:";
                     case "InfluxRequests":
                         if (data.TryGetProperty("HourlyData", out var hourly))
                         {
-                            sb.AppendLine("DateTime,Hour Count,Request ID,Display ID,Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Technician,Technician Email,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
+                            prefixColumns.AddRange(new[] { "DateTime", "Hour Count" });
                             foreach (var item in hourly.EnumerateArray())
                             {
                                 var dateTime = item.GetProperty("DateTime").GetDateTime().ToString("yyyy-MM-dd HH:00");
@@ -2517,100 +2474,180 @@ Generate a friendly, conversational response:";
 
                                 foreach (var req in item.GetProperty("Requests").EnumerateArray())
                                 {
-                                    sb.AppendLine($"\"{dateTime}\",\"{count}\"," + BuildRequestCsvLine(req));
+                                    var reqDict = JsonElementToDictionary(req);
+                                    reqDict["DateTime"] = dateTime;
+                                    reqDict["Hour Count"] = count;
+                                    allRequests.Add(reqDict);
                                 }
                             }
                         }
-                        else
+                        else if (data.TryGetProperty("DailyData", out var daily))
                         {
-                            sb.AppendLine("Date,Day Count,Request ID,Display ID,Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Technician,Technician Email,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
-                            foreach (var item in data.GetProperty("DailyData").EnumerateArray())
+                            prefixColumns.AddRange(new[] { "Date", "Day Count" });
+                            foreach (var item in daily.EnumerateArray())
                             {
                                 var date = item.GetProperty("Date").GetDateTime().ToString("yyyy-MM-dd");
                                 var count = item.GetProperty("Count").GetInt32();
 
                                 foreach (var req in item.GetProperty("Requests").EnumerateArray())
                                 {
-                                    sb.AppendLine($"\"{date}\",\"{count}\"," + BuildRequestCsvLine(req));
+                                    var reqDict = JsonElementToDictionary(req);
+                                    reqDict["Date"] = date;
+                                    reqDict["Day Count"] = count;
+                                    allRequests.Add(reqDict);
                                 }
                             }
                         }
                         break;
 
                     case "RequestSearch":
-                        sb.AppendLine("Request ID,Display ID,Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Technician,Technician Email,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
-                        foreach (var r in data.GetProperty("Requests").EnumerateArray())
+                        foreach (var req in data.GetProperty("Requests").EnumerateArray())
                         {
-                            sb.AppendLine(BuildRequestCsvLine(r));
+                            allRequests.Add(JsonElementToDictionary(req));
                         }
                         break;
 
                     default:
-                        sb.AppendLine("No data available");
-                        break;
+                        return Encoding.UTF8.GetBytes("No data available");
+                }
+
+                // If no requests, return empty
+                if (allRequests.Count == 0)
+                {
+                    return Encoding.UTF8.GetBytes("No records found");
+                }
+
+                // Collect all unique column names across all requests
+                var allColumns = new HashSet<string>();
+                foreach (var req in allRequests)
+                {
+                    foreach (var key in req.Keys)
+                    {
+                        allColumns.Add(key);
+                    }
+                }
+
+                // Determine which columns have at least one non-empty value
+                var columnsWithData = new HashSet<string>();
+                foreach (var col in allColumns)
+                {
+                    foreach (var req in allRequests)
+                    {
+                        if (req.TryGetValue(col, out var val) && HasValue(val))
+                        {
+                            columnsWithData.Add(col);
+                            break;
+                        }
+                    }
+                }
+
+                // Order columns: prefix columns first, then sorted remaining columns
+                var orderedColumns = new List<string>();
+
+                // Add prefix columns that have data
+                foreach (var col in prefixColumns)
+                {
+                    if (columnsWithData.Contains(col))
+                    {
+                        orderedColumns.Add(col);
+                        columnsWithData.Remove(col);
+                    }
+                }
+
+                // Define preferred column order for common fields
+                var preferredOrder = new[]
+                {
+            "Request ID", "Subject", "Description", "Status", "Technician", "Requester Name",
+            "Created Date", "Due by date", "Responded Date", "Completed Date", "Resolved Time",
+            "Last Updated Time", "Category", "Sub Category", "Item", "Priority", "Urgency",
+            "Impact", "Request Type", "Level", "Mode", "Department", "Site", "Group",
+            "Template Name", "Created By", "Last Updated By", "Resolution", "Resolution Time",
+            "Is Overdue", "Is Response Overdue"
+        };
+
+                // Add preferred columns that have data
+                foreach (var col in preferredOrder)
+                {
+                    if (columnsWithData.Contains(col))
+                    {
+                        orderedColumns.Add(col);
+                        columnsWithData.Remove(col);
+                    }
+                }
+
+                // Add remaining columns sorted alphabetically
+                orderedColumns.AddRange(columnsWithData.OrderBy(c => c));
+
+                // Build CSV
+                var csvBuilder = new StringBuilder();
+
+                // Header row
+                csvBuilder.AppendLine(string.Join(",", orderedColumns.Select(c => $"\"{Safe(c)}\"")));
+
+                // Data rows
+                foreach (var req in allRequests)
+                {
+                    var values = new List<string>();
+                    foreach (var col in orderedColumns)
+                    {
+                        var val = req.TryGetValue(col, out var v) ? Safe(v) : "";
+                        values.Add($"\"{val}\"");
+                    }
+                    csvBuilder.AppendLine(string.Join(",", values));
+                }
+
+                return Encoding.UTF8.GetBytes(csvBuilder.ToString());
+            }
+
+            return Encoding.UTF8.GetBytes("Invalid data format");
+        }
+
+        private Dictionary<string, object> JsonElementToDictionary(JsonElement element)
+        {
+            var dict = new Dictionary<string, object>();
+
+            if (element.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var property in element.EnumerateObject())
+                {
+                    var key = property.Name;
+                    var value = property.Value;
+
+                    object parsedValue = value.ValueKind switch
+                    {
+                        JsonValueKind.String => value.GetString() ?? "",
+                        JsonValueKind.Number => value.TryGetInt64(out var l) ? l : value.GetDouble(),
+                        JsonValueKind.True => "true",
+                        JsonValueKind.False => "false",
+                        JsonValueKind.Null => "",
+                        JsonValueKind.Object => "", // Skip nested objects for CSV
+                        JsonValueKind.Array => "", // Skip arrays for CSV
+                        _ => ""
+                    };
+
+                    // Handle "-" as empty
+                    if (parsedValue?.ToString() == "-")
+                    {
+                        parsedValue = "";
+                    }
+
+                    // Strip HTML from Description
+                    if (key.Equals("Description", StringComparison.OrdinalIgnoreCase) && parsedValue is string descStr)
+                    {
+                        parsedValue = System.Text.RegularExpressions.Regex.Replace(descStr, "<[^>]*>", " ")
+                            .Replace("&nbsp;", " ")
+                            .Replace("&amp;", "&")
+                            .Replace("&lt;", "<")
+                            .Replace("&gt;", ">")
+                            .Replace("  ", " ")
+                            .Trim();
+                    }
+
+                    dict[key] = parsedValue;
                 }
             }
 
-            return Encoding.UTF8.GetBytes(sb.ToString());
-        }
-
-        /// <summary>
-        /// Build a CSV line for a single request with ALL fields
-        /// </summary>
-        private string BuildRequestCsvLine(JsonElement r)
-        {
-            string Safe(object? value) => value?.ToString()?.Replace("\"", "\"\"").Replace("\n", " ").Replace("\r", "") ?? "";
-
-            var fields = new List<string>
-            {
-                Safe(r.TryGetProperty("Id", out var id) ? id.GetString() : ""),
-                Safe(r.TryGetProperty("DisplayId", out var did) ? did.GetString() : ""),
-                Safe(r.TryGetProperty("Subject", out var subj) ? subj.GetString() : ""),
-                Safe(r.TryGetProperty("Description", out var desc) ? desc.GetString() : ""),
-                Safe(r.TryGetProperty("Status", out var st) ? st.GetString() : ""),
-                Safe(r.TryGetProperty("StatusInternal", out var sti) ? sti.GetString() : ""),
-                r.TryGetProperty("CreatedTime", out var ct) ? ct.GetDateTime().ToString("yyyy-MM-dd HH:mm") : "",
-                Safe(r.TryGetProperty("DueByTime", out var dbt) ? dbt.GetString() : ""),
-                Safe(r.TryGetProperty("RespondedDate", out var rpd) ? rpd.GetString() : ""),
-                Safe(r.TryGetProperty("CompletedDate", out var cd) ? cd.GetString() : ""),
-                Safe(r.TryGetProperty("ResolvedTime", out var rt) ? rt.GetString() : ""),
-                Safe(r.TryGetProperty("LastUpdatedTime", out var lut) ? lut.GetString() : ""),
-                Safe(r.TryGetProperty("TechnicianName", out var tn) ? tn.GetString() : ""),
-                Safe(r.TryGetProperty("TechnicianEmail", out var te) ? te.GetString() : ""),
-                Safe(r.TryGetProperty("RequesterName", out var rn) ? rn.GetString() : ""),
-                Safe(r.TryGetProperty("RequesterEmail", out var re) ? re.GetString() : ""),
-                Safe(r.TryGetProperty("RequesterPhone", out var rp) ? rp.GetString() : ""),
-                Safe(r.TryGetProperty("RequesterMobile", out var rm) ? rm.GetString() : ""),
-                Safe(r.TryGetProperty("RequesterDepartment", out var rd) ? rd.GetString() : ""),
-                Safe(r.TryGetProperty("RequesterSite", out var rs) ? rs.GetString() : ""),
-                Safe(r.TryGetProperty("RequesterJobTitle", out var rjt) ? rjt.GetString() : ""),
-                Safe(r.TryGetProperty("RequesterEmployeeId", out var rei) ? rei.GetString() : ""),
-                Safe(r.TryGetProperty("Category", out var cat) ? cat.GetString() : ""),
-                Safe(r.TryGetProperty("Subcategory", out var scat) ? scat.GetString() : ""),
-                Safe(r.TryGetProperty("Item", out var item) ? item.GetString() : ""),
-                Safe(r.TryGetProperty("Priority", out var pri) ? pri.GetString() : ""),
-                Safe(r.TryGetProperty("Urgency", out var urg) ? urg.GetString() : ""),
-                Safe(r.TryGetProperty("Impact", out var imp) ? imp.GetString() : ""),
-                Safe(r.TryGetProperty("RequestType", out var rtype) ? rtype.GetString() : ""),
-                Safe(r.TryGetProperty("Level", out var lvl) ? lvl.GetString() : ""),
-                Safe(r.TryGetProperty("Mode", out var mode) ? mode.GetString() : ""),
-                Safe(r.TryGetProperty("Group", out var grp) ? grp.GetString() : ""),
-                Safe(r.TryGetProperty("Template", out var tmpl) ? tmpl.GetString() : ""),
-                Safe(r.TryGetProperty("Site", out var site) ? site.GetString() : ""),
-                Safe(r.TryGetProperty("Department", out var dept) ? dept.GetString() : ""),
-                r.TryGetProperty("IsServiceRequest", out var isr) ? isr.GetBoolean().ToString().ToLower() : "false",
-                r.TryGetProperty("HasNotes", out var hn) ? hn.GetBoolean().ToString().ToLower() : "false",
-                r.TryGetProperty("IsOverdue", out var iod) ? iod.GetBoolean().ToString().ToLower() : "false",
-                r.TryGetProperty("IsResponseOverdue", out var iro) ? iro.GetBoolean().ToString().ToLower() : "false",
-                Safe(r.TryGetProperty("Resolution", out var res) ? res.GetString() : ""),
-                Safe(r.TryGetProperty("ResolutionSubmittedBy", out var rsb) ? rsb.GetString() : ""),
-                Safe(r.TryGetProperty("ResolutionTime", out var restime) ? restime.GetString() : ""),
-                Safe(r.TryGetProperty("CreatedBy", out var cb) ? cb.GetString() : ""),
-                Safe(r.TryGetProperty("LastUpdatedBy", out var lub) ? lub.GetString() : ""),
-                Safe(r.TryGetProperty("OnBehalfOf", out var obo) ? obo.GetString() : "")
-            };
-
-            return string.Join(",", fields.Select(f => $"\"{f}\""));
+            return dict;
         }
     }
 
