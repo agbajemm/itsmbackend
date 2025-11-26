@@ -2272,7 +2272,7 @@ Generate a friendly, conversational response:";
         }
     }
 
-    // Helper Cl
+    // Helper C
     public class NaturalQueryRequest
     {
         public string Query { get; set; }
