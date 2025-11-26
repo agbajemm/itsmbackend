@@ -41,6 +41,10 @@ namespace documentchecker.Controllers
         private readonly AppDbContext _dbContext;
         private readonly IServiceProvider _serviceProvider;
 
+        // Thread lock dictionary to prevent concurrent operations on same thread
+        private static readonly Dictionary<string, SemaphoreSlim> _threadLocks = new();
+        private static readonly object _lockDictLock = new();
+
         public MainController(
             IConfiguration configuration,
             IHttpClientFactory httpClientFactory,
@@ -63,6 +67,18 @@ namespace documentchecker.Controllers
             _requestStorageService = requestStorageService;
             _dbContext = dbContext;
             _serviceProvider = serviceProvider;
+        }
+
+        private SemaphoreSlim GetThreadLock(string threadId)
+        {
+            lock (_lockDictLock)
+            {
+                if (!_threadLocks.ContainsKey(threadId))
+                {
+                    _threadLocks[threadId] = new SemaphoreSlim(1, 1);
+                }
+                return _threadLocks[threadId];
+            }
         }
 
         [HttpPost("sync-requests")]
@@ -109,7 +125,7 @@ namespace documentchecker.Controllers
 
             try
             {
-                // Background sync
+                // Background sync (fire and forget)
                 _ = Task.Run(async () =>
                 {
                     try
@@ -148,11 +164,10 @@ namespace documentchecker.Controllers
                     conversation.UserEmail = request.UserEmail;
                 }
 
-                // Thread ID = Session ID for conversation continuity
+                // Thread ID management - create if not exists
                 string threadId;
                 if (string.IsNullOrEmpty(conversation.ThreadId))
                 {
-                    // Create new thread in Azure AI Foundry
                     var threadResponse = await agentsClient.Threads.CreateThreadAsync();
                     threadId = threadResponse.Value.Id;
                     conversation.ThreadId = threadId;
@@ -163,6 +178,9 @@ namespace documentchecker.Controllers
                     threadId = conversation.ThreadId;
                 }
 
+                // Get thread lock to prevent concurrent operations
+                var threadLock = GetThreadLock(threadId);
+
                 // Add user message to conversation history
                 var userMessageEntity = new ChatMessage { Role = "user", Content = request.Query };
                 conversation.Messages.Add(userMessageEntity);
@@ -171,69 +189,96 @@ namespace documentchecker.Controllers
                 // Build conversation context from previous messages
                 var conversationContext = BuildConversationContext(conversation);
 
-                // STEP 1: Query Analysis Agent - Extract structured parameters
-                var queryAnalysis = await AnalyzeQueryWithAgent(agentsClient, threadId, request.Query, conversationContext, request.UserEmail);
-                Console.WriteLine($"Query Analysis: {JsonSerializer.Serialize(queryAnalysis)}");
-
-                // STEP 2: Retrieve data from database based on analysis
-                var retrievedData = await RetrieveDataBasedOnAnalysis(queryAnalysis, request.UserEmail);
-
-                // STEP 3: Data Retrieval Agent - Optional refinement
-                var dataSummary = GenerateDataSummary(retrievedData, queryAnalysis);
-                var refinedAnalysis = await RefineQueryWithDataRetrievalAgent(agentsClient, threadId, request.Query, queryAnalysis, dataSummary, conversationContext);
-
-                // If refinement produced a better analysis, use it and re-query data
-                if (refinedAnalysis != null && refinedAnalysis.QueryType != queryAnalysis.QueryType)
+                // Acquire lock with timeout
+                if (!await threadLock.WaitAsync(TimeSpan.FromSeconds(90)))
                 {
-                    queryAnalysis = refinedAnalysis;
-                    retrievedData = await RetrieveDataBasedOnAnalysis(queryAnalysis, request.UserEmail);
-                    dataSummary = GenerateDataSummary(retrievedData, queryAnalysis);
+                    return StatusCode(503, new
+                    {
+                        Error = "System is busy processing a previous request. Please try again in a moment.",
+                        ConversationalResponse = "I'm currently processing your previous request. Please wait a moment and try again."
+                    });
                 }
 
-                // STEP 4: Conversation Agent - Generate friendly response
-                var conversationalResponse = await GenerateConversationalResponseWithAgent(
-                    agentsClient,
-                    threadId,
-                    request.Query,
-                    retrievedData,
-                    queryAnalysis,
-                    conversationContext
-                );
-
-                // Generate CSV file reference
-                var fileName = $"queryresult_{DateTime.UtcNow:yyyyMMddHHmmss}.csv";
-                var url = $"/api/Main/download-result/{sessionId}/{fileName}";
-
-                var finalResponseFull = new
+                try
                 {
-                    SessionId = sessionId,
-                    ThreadId = threadId,
-                    ConversationalResponse = conversationalResponse,
-                    ExcelFile = new
+                    // Wait for any active runs to complete before proceeding
+                    await WaitForActiveRunsToComplete(agentsClient, threadId);
+
+                    // STEP 1: Query Analysis Agent - Extract structured parameters
+                    var queryAnalysis = await AnalyzeQueryWithAgent(agentsClient, threadId, request.Query, conversationContext, request.UserEmail);
+                    Console.WriteLine($"Query Analysis: {JsonSerializer.Serialize(queryAnalysis)}");
+
+                    // STEP 2: Retrieve data from database based on analysis
+                    var retrievedData = await RetrieveDataBasedOnAnalysis(queryAnalysis, request.UserEmail);
+
+                    // STEP 3: Data Retrieval Agent - Optional refinement
+                    var dataSummary = GenerateDataSummary(retrievedData, queryAnalysis);
+
+                    // Wait for any active runs before refinement agent
+                    await WaitForActiveRunsToComplete(agentsClient, threadId);
+
+                    var refinedAnalysis = await RefineQueryWithDataRetrievalAgent(agentsClient, threadId, request.Query, queryAnalysis, dataSummary, conversationContext);
+
+                    // If refinement produced a better analysis, use it and re-query data
+                    if (refinedAnalysis != null && refinedAnalysis.QueryType != queryAnalysis.QueryType)
                     {
-                        FileName = fileName,
-                        Url = url
-                    },
-                    Data = retrievedData,
-                    QueryAnalysis = queryAnalysis
-                };
+                        queryAnalysis = refinedAnalysis;
+                        retrievedData = await RetrieveDataBasedOnAnalysis(queryAnalysis, request.UserEmail);
+                        dataSummary = GenerateDataSummary(retrievedData, queryAnalysis);
+                    }
 
-                var agentMessage = new ChatMessage
-                {
-                    Role = "agent",
-                    Content = JsonSerializer.Serialize(finalResponseFull)
-                };
-                conversation.Messages.Add(agentMessage);
-                await _dbContext.SaveChangesAsync();
+                    // Wait for any active runs before conversation agent
+                    await WaitForActiveRunsToComplete(agentsClient, threadId);
 
-                return Ok(new
+                    // STEP 4: Conversation Agent - Generate friendly response
+                    var conversationalResponse = await GenerateConversationalResponseWithAgent(
+                        agentsClient,
+                        threadId,
+                        request.Query,
+                        retrievedData,
+                        queryAnalysis,
+                        conversationContext
+                    );
+
+                    // Generate CSV file reference
+                    var fileName = $"queryresult_{DateTime.UtcNow:yyyyMMddHHmmss}.csv";
+                    var url = $"/api/Main/download-result/{sessionId}/{fileName}";
+
+                    var finalResponseFull = new
+                    {
+                        SessionId = sessionId,
+                        ThreadId = threadId,
+                        ConversationalResponse = conversationalResponse,
+                        ExcelFile = new
+                        {
+                            FileName = fileName,
+                            Url = url
+                        },
+                        Data = retrievedData,
+                        QueryAnalysis = queryAnalysis
+                    };
+
+                    var agentMessage = new ChatMessage
+                    {
+                        Role = "agent",
+                        Content = JsonSerializer.Serialize(finalResponseFull)
+                    };
+                    conversation.Messages.Add(agentMessage);
+                    await _dbContext.SaveChangesAsync();
+
+                    return Ok(new
+                    {
+                        SessionId = sessionId,
+                        ThreadId = threadId,
+                        ConversationalResponse = conversationalResponse,
+                        ExcelFile = finalResponseFull.ExcelFile,
+                        Summary = ExtractSummaryFromData(retrievedData, queryAnalysis)
+                    });
+                }
+                finally
                 {
-                    SessionId = sessionId,
-                    ThreadId = threadId,
-                    ConversationalResponse = conversationalResponse,
-                    ExcelFile = finalResponseFull.ExcelFile,
-                    Summary = ExtractSummaryFromData(retrievedData, queryAnalysis)
-                });
+                    threadLock.Release();
+                }
             }
             catch (Exception ex)
             {
@@ -244,6 +289,47 @@ namespace documentchecker.Controllers
                     ConversationalResponse = "I apologize, but I encountered an issue processing your request. Could you please rephrase your question?"
                 });
             }
+        }
+
+        /// <summary>
+        /// Wait for any active runs on a thread to complete before adding new messages
+        /// </summary>
+        private async Task WaitForActiveRunsToComplete(PersistentAgentsClient client, string threadId, int maxWaitSeconds = 60)
+        {
+            var startTime = DateTime.UtcNow;
+            while ((DateTime.UtcNow - startTime).TotalSeconds < maxWaitSeconds)
+            {
+                try
+                {
+                    // Get all runs for this thread
+                    var runsAsync = client.Runs.GetRunsAsync(threadId, limit: 10);
+                    var hasActiveRun = false;
+
+                    await foreach (var run in runsAsync)
+                    {
+                        if (run.Status == RunStatus.InProgress || run.Status == RunStatus.Queued || run.Status == RunStatus.RequiresAction)
+                        {
+                            hasActiveRun = true;
+                            Console.WriteLine($"Waiting for active run {run.Id} with status {run.Status}...");
+                            break;
+                        }
+                    }
+
+                    if (!hasActiveRun)
+                    {
+                        return; // No active runs, safe to proceed
+                    }
+
+                    await Task.Delay(1000); // Wait 1 second before checking again
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error checking run status: {ex.Message}");
+                    await Task.Delay(500);
+                }
+            }
+
+            Console.WriteLine($"Timeout waiting for active runs to complete on thread {threadId}");
         }
 
         private string BuildConversationContext(ChatConversation conversation)
@@ -262,54 +348,81 @@ namespace documentchecker.Controllers
                 return string.Empty;
 
             var sb = new StringBuilder();
-            sb.AppendLine("Recent conversation history:");
+            sb.AppendLine("=== CONVERSATION HISTORY ===");
 
             foreach (var msg in recentMessages)
             {
-                var role = msg.Role == "user" ? "User" : "Assistant";
+                var role = msg.Role == "user" ? "USER" : "ASSISTANT";
                 var content = msg.Content;
 
-                // For agent messages, extract conversational response from JSON
-                if (role == "Assistant" && content.StartsWith("{"))
+                // For agent messages, extract useful context from JSON
+                if (role == "ASSISTANT" && content.StartsWith("{"))
                 {
                     try
                     {
                         var doc = JsonDocument.Parse(content);
-                        if (doc.RootElement.TryGetProperty("ConversationalResponse", out var resp))
+                        var root = doc.RootElement;
+
+                        // Extract the query analysis to understand what was searched
+                        if (root.TryGetProperty("QueryAnalysis", out var analysisElem))
                         {
-                            content = resp.GetString() ?? content;
+                            var queryType = analysisElem.TryGetProperty("queryType", out var qt) ? qt.GetString() : "";
+                            var technician = analysisElem.TryGetProperty("technician", out var tech) ? tech.GetString() : "";
+                            var status = analysisElem.TryGetProperty("status", out var st) ? st.GetString() : "";
+                            var dateFrom = analysisElem.TryGetProperty("dateFrom", out var df) ? df.GetString() : "";
+                            var dateTo = analysisElem.TryGetProperty("dateTo", out var dt) ? dt.GetString() : "";
+
+                            sb.AppendLine($"[Previous Query: type={queryType}, technician={technician}, status={status}, period={dateFrom} to {dateTo}]");
                         }
-                        // Also try to extract key data points for better context
-                        if (doc.RootElement.TryGetProperty("Data", out var dataElem))
+
+                        // Extract key data points
+                        if (root.TryGetProperty("Data", out var dataElem))
                         {
+                            // For technician-related queries, extract technician names
                             if (dataElem.TryGetProperty("InactiveTechnicians", out var inactiveTechs))
                             {
                                 var names = inactiveTechs.EnumerateArray()
-                                    .Take(5)
+                                    .Take(20)
                                     .Select(t => t.GetProperty("Technician").GetString())
-                                    .Where(n => !string.IsNullOrEmpty(n));
-                                content += $"\n[Mentioned technicians: {string.Join(", ", names)}]";
+                                    .Where(n => !string.IsNullOrEmpty(n))
+                                    .ToList();
+                                sb.AppendLine($"[Technicians mentioned: {string.Join(", ", names)}]");
                             }
                             else if (dataElem.TryGetProperty("TopTechnicians", out var topTechs))
                             {
                                 var names = topTechs.EnumerateArray()
-                                    .Take(5)
+                                    .Take(20)
                                     .Select(t => t.GetProperty("Technician").GetString())
-                                    .Where(n => !string.IsNullOrEmpty(n));
-                                content += $"\n[Mentioned technicians: {string.Join(", ", names)}]";
+                                    .Where(n => !string.IsNullOrEmpty(n))
+                                    .ToList();
+                                sb.AppendLine($"[Technicians mentioned: {string.Join(", ", names)}]");
                             }
+
+                            // For request searches, note the count
+                            if (dataElem.TryGetProperty("RequestsFound", out var reqFound))
+                            {
+                                sb.AppendLine($"[Found {reqFound.GetInt32()} requests]");
+                            }
+                        }
+
+                        // Also include the conversational response for context
+                        if (root.TryGetProperty("ConversationalResponse", out var resp))
+                        {
+                            content = resp.GetString() ?? "";
+                            if (content.Length > 300)
+                                content = content.Substring(0, 300) + "...";
                         }
                     }
                     catch { }
                 }
 
-                if (content.Length > 400)
-                    content = content.Substring(0, 400) + "...";
-
                 sb.AppendLine($"{role}: {content}");
             }
 
-            sb.AppendLine("\nUse this context to understand references like 'them', 'those', 'the technicians', previous queries, and maintain conversational continuity.");
+            sb.AppendLine("=== END HISTORY ===");
+            sb.AppendLine("\nIMPORTANT: Use this context to understand references like 'them', 'those', 'the technicians', 'how many are open', etc.");
+            sb.AppendLine("If user asks a follow-up like 'how many of them are open', apply the previous filters PLUS the new 'open' status filter.");
+
             return sb.ToString();
         }
 
@@ -320,16 +433,25 @@ namespace documentchecker.Controllers
             string conversationContext,
             string userEmail = "")
         {
-            var currentDate = DateTime.UtcNow.ToString("yyyy-MM-dd");
-            var currentTime = DateTime.UtcNow.ToString("HH:mm");
+            // IMPORTANT: Use local timezone-aware date calculations
+            var now = DateTime.UtcNow;
+            var today = now.Date;
+            var yesterday = today.AddDays(-1);
+            var thisMonthStart = new DateTime(now.Year, now.Month, 1);
 
-            // Enhanced agent instructions with comprehensive examples
-            var instructions = @"You are a query analysis agent for an IT service desk system. 
+            var currentDate = today.ToString("yyyy-MM-dd");
+            var yesterdayDate = yesterday.ToString("yyyy-MM-dd");
+            var currentTime = now.ToString("HH:mm");
+
+            var instructions = $@"You are a query analysis agent for an IT service desk system.
+
+CRITICAL: Today's date is {currentDate}. Yesterday was {yesterdayDate}. Current time is {currentTime} UTC.
+This month started on {thisMonthStart:yyyy-MM-dd}.
 
 Your task: Analyze the user query and return ONLY a valid JSON object with NO explanations or markdown.
 
 Schema:
-{
+{{
   ""queryType"": ""inactive_technicians|influx_requests|top_request_areas|top_technicians|request_search"",
   ""dateFrom"": ""yyyy-MM-dd HH:mm or null"",
   ""dateTo"": ""yyyy-MM-dd HH:mm or null"",
@@ -343,74 +465,68 @@ Schema:
   ""isUserRequest"": boolean,
   ""isUserTechnician"": boolean,
   ""status"": ""open|closed|null""
-}
+}}
 
 Query Types:
 1. inactive_technicians - technicians with no activity in period
 2. influx_requests - request volume by hour/day
 3. top_request_areas - most common request subjects
 4. top_technicians - technician performance ranking
-5. request_search - search with filters
+5. request_search - search with filters (DEFAULT for most queries)
 
-Time Parsing Rules:
-- 'today' → current date 00:00 to 23:59
-- 'yesterday' → previous date 00:00 to 23:59
-- 'past 2 weeks' or '2 weeks' → 14 days back to now
-- 'past X days' → X days back to now
-- 'this week' → 7 days back
-- 'this month' → 1st of month to today
-- 'last month' → previous month full range
+=== DATE PARSING RULES (CRITICAL) ===
+- 'today' → {currentDate} 00:00 to {currentDate} 23:59
+- 'yesterday' → {yesterdayDate} 00:00 to {yesterdayDate} 23:59
+- 'this week' → {today.AddDays(-7):yyyy-MM-dd} 00:00 to {currentDate} 23:59
+- 'this month' → {thisMonthStart:yyyy-MM-dd} 00:00 to {currentDate} 23:59
+- 'past X days' or 'last X days' → {today.AddDays(-1):yyyy-MM-dd} adjusted by X days
 
-Default Ranges (when not specified):
-- inactive_technicians: 30 days
-- influx_requests: 7 days
-- top_request_areas: 30 days
-- top_technicians: 30 days
-- request_search: 30 days
-
-Status Filtering:
+=== STATUS FILTERING ===
 - 'open' includes: open, in progress, pending
 - 'closed' includes: closed, resolved, completed
-- Extract from keywords: 'open requests', 'closed tickets', 'pending', 'resolved'
+- Keywords: 'open requests', 'closed tickets', 'pending', 'resolved'
 
-Personalization Rules:
+=== PERSONALIZATION RULES ===
 - 'my requests' / 'tickets I opened' / 'requests from me' → isUserRequest: true
-- 'assigned to me' / 'my assigned tickets' / 'tickets treated by me' → isUserTechnician: true
-- Specific names in query → extract to 'technician' or 'requester' fields
-- List from context (e.g., 'them', 'those') → use 'technicians' array
+- 'assigned to me' / 'my tickets' / 'tickets I have' → isUserTechnician: true
+- Specific names → extract to 'technician' or 'requester'
 
-Conversation Context:
-- If user refers to 'them', 'those', 'the technicians', extract names from context into technicians array
-- Maintain continuity with previous queries and filters
-- For follow-up questions, preserve previous parameters
+=== FOLLOW-UP QUERY HANDLING (VERY IMPORTANT) ===
+If the conversation context shows a previous query, and the user asks a follow-up:
+- 'how many of them are open' → Keep previous technician filter, ADD status: 'open'
+- 'show me closed ones' → Keep previous filters, CHANGE status to 'closed'
+- 'what about this week' → Keep previous type/filters, CHANGE date range
 
-Examples:
-Query: show me my open requests
-Response: {""queryType"": ""request_search"", ""dateFrom"": """ + DateTime.UtcNow.AddDays(-30).ToString("yyyy-MM-dd") + @" 00:00"", ""dateTo"": """ + currentDate + @" 23:59"", ""isUserRequest"": true, ""status"": ""open"", ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserTechnician"": false}
+ALWAYS preserve relevant filters from context for follow-up questions.
 
-Query: technicians inactive for 2 weeks
-Response: {""queryType"": ""inactive_technicians"", ""inactivityPeriod"": ""14 days"", ""dateFrom"": null, ""dateTo"": null, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}
+=== EXAMPLES ===
 
-Query: top 10 technicians this month
-Response: {""queryType"": ""top_technicians"", ""dateFrom"": """ + new DateTime(DateTime.UtcNow.Year, DateTime.UtcNow.Month, 1).ToString("yyyy-MM-dd") + @" 00:00"", ""dateTo"": """ + currentDate + @" 23:59"", ""topN"": 10, ""timeUnit"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}
+Query: ""what tickets do i have assigned to me""
+→ {{""queryType"": ""request_search"", ""dateFrom"": ""{today.AddDays(-30):yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""isUserTechnician"": true, ""status"": null, ""technician"": null, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false}}
 
-Query: show influx of requests today by hour
-Response: {""queryType"": ""influx_requests"", ""dateFrom"": """ + currentDate + @" 00:00"", ""dateTo"": """ + currentDate + @" 23:59"", ""timeUnit"": ""hour"", ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}
+Query: ""how many tickets assigned to akinola this month""
+→ {{""queryType"": ""request_search"", ""dateFrom"": ""{thisMonthStart:yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""technician"": ""akinola"", ""status"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null}}
 
-Query: password reset requests from John
-Response: {""queryType"": ""request_search"", ""dateFrom"": """ + DateTime.UtcNow.AddDays(-30).ToString("yyyy-MM-dd") + @" 00:00"", ""dateTo"": """ + currentDate + @" 23:59"", ""subject"": ""password reset"", ""requester"": ""John"", ""timeUnit"": null, ""topN"": null, ""technician"": null, ""technicians"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}
+Query: ""how many of them are open"" (after asking about akinola)
+→ {{""queryType"": ""request_search"", ""dateFrom"": ""{thisMonthStart:yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""technician"": ""akinola"", ""status"": ""open"", ""isUserRequest"": false, ""isUserTechnician"": false, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null}}
+
+Query: ""what hour had an influx of requests yesterday""
+→ {{""queryType"": ""influx_requests"", ""dateFrom"": ""{yesterdayDate} 00:00"", ""dateTo"": ""{yesterdayDate} 23:59"", ""timeUnit"": ""hour"", ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}}
 
 Output ONLY the JSON object. No markdown code blocks, no explanations.";
 
             var prompt = $@"Current Date: {currentDate}
-Current Time: {currentTime}
+Current Time: {currentTime} UTC
+Yesterday: {yesterdayDate}
+This Month Start: {thisMonthStart:yyyy-MM-dd}
 User Email: {(string.IsNullOrEmpty(userEmail) ? "Unknown" : userEmail)}
 
-{(!string.IsNullOrEmpty(conversationContext) ? $"CONVERSATION CONTEXT:\n{conversationContext}\n" : "")}
+{(!string.IsNullOrEmpty(conversationContext) ? conversationContext : "")}
 
-USER QUERY: {userQuery}";
+USER QUERY: {userQuery}
 
-            // Call agent via API
+Return ONLY the JSON analysis:";
+
             var responses = await RunAgentAsync(client, threadId, _queryAnalysisAgentId, prompt, instructions);
 
             // Parse response
@@ -445,7 +561,6 @@ USER QUERY: {userQuery}";
                                     "top_technicians" => 30,
                                     _ => 30
                                 };
-                                var now = DateTime.UtcNow;
                                 analysis.DateTo = now.ToString("yyyy-MM-dd HH:mm");
                                 analysis.DateFrom = now.AddDays(-defaultDays).ToString("yyyy-MM-dd HH:mm");
                             }
@@ -464,7 +579,7 @@ USER QUERY: {userQuery}";
             }
 
             // Fallback
-            return await FallbackHeuristicAnalysis(userQuery, userEmail);
+            return await FallbackHeuristicAnalysis(userQuery, userEmail, conversationContext);
         }
 
         private async Task<QueryAnalysis?> RefineQueryWithDataRetrievalAgent(
@@ -536,102 +651,203 @@ Is this analysis correct? If not, provide improved JSON.";
         {
             var dataSummary = GenerateDataSummary(data, analysis);
 
-            var instructions = @"You are a friendly IT service desk assistant.
+            var instructions = @"You are a friendly, helpful IT service desk assistant named AIDA (AI Desk Assistant).
 
-Generate a warm, professional conversational response (2-5 paragraphs) that:
-1. Acknowledges the user's query naturally
-2. Highlights key findings with bullet points (top 3-10 items)
-3. Provides insights and patterns in the data
-4. Mentions the downloadable CSV file for full details
-5. If this is a follow-up (based on context), acknowledge continuity
-6. Uses encouraging and positive tone
+Generate a warm, conversational response that feels like talking to a helpful colleague. Follow these guidelines:
 
-IMPORTANT:
-- Always explicitly list top items using bullet points (•)
-- Be specific with numbers and names
-- Sound conversational, not robotic
-- Celebrate successes when appropriate
-- Provide actionable insights
+TONE:
+- Be warm and personable, not robotic
+- Use natural language, not bullet-heavy lists
+- Sound like a knowledgeable colleague sharing insights
+- Show enthusiasm when sharing positive news
 
-NO markdown code blocks. Plain text with bullet points only.";
+STRUCTURE (2-4 paragraphs):
+1. Start with a brief, natural acknowledgment of what they asked
+2. Share the key finding or number prominently
+3. Highlight 3-5 notable items naturally in prose (use bullet points sparingly)
+4. End with a helpful note about the downloadable file and offer to help further
 
-            var userRequestNote = analysis.IsUserRequest ? "\n[Note: Results filtered to show only user's submitted requests]" :
-                analysis.IsUserTechnician ? "\n[Note: Results filtered to show only requests assigned to user as technician]" : "";
+EXAMPLES OF GOOD RESPONSES:
 
-            var statusNote = !string.IsNullOrEmpty(analysis.Status) ? 
-                $"\n[Status filter: {analysis.Status} requests only]" : "";
+For ""how many tickets assigned to akinola this month"":
+""Looking at Akinola's workload this month, I found 72 tickets assigned to them. That's a solid amount of activity! The tickets cover a range of areas including password resets, hardware requests, and software installations. You can download the full breakdown in the CSV file for more details. Would you like me to filter these by status or category?""
 
-            var prompt = $"User Query: \"{userQuery}\"\n" +
-                         $"Query Type: {analysis.QueryType}\n" +
-                         $"Period: {analysis.DateFrom ?? "N/A"} to {analysis.DateTo ?? "N/A"}\n" +
-                         statusNote +
-                         userRequestNote +
-                         (string.IsNullOrEmpty(conversationContext) ? string.Empty : $"\nConversation Context:\n{conversationContext}\n") +
-                         $"\nDATA SUMMARY:\n{dataSummary}\n\nGenerate friendly, conversational response now:";
+For ""what tickets do I have assigned to me"":
+""You currently have 15 tickets assigned to you. Most of them are in 'Open' or 'In Progress' status. The oldest one is from 3 days ago regarding a VPN connection issue. I've included all the details in the CSV file. Let me know if you'd like me to help prioritize or filter these further!""
+
+For influx queries:
+""Yesterday saw 47 requests come through, with the busiest period between 9-10 AM when 12 tickets were logged - probably the morning rush! Things quieted down after lunch with only a handful in the afternoon. The full hourly breakdown is in the CSV.""
+
+AVOID:
+- Starting with ""I processed your query successfully""
+- Excessive bullet points
+- Robotic language like ""Key findings:""
+- Generic phrases like ""Here's what I found""
+- Repeating ""You can download the full CSV"" multiple times
+
+Remember: Sound human, be helpful, share insights naturally.";
+
+            var userRequestNote = analysis.IsUserRequest ? "\n[Filtered to user's submitted requests]" :
+                analysis.IsUserTechnician ? "\n[Filtered to requests assigned to user as technician]" : "";
+
+            var statusNote = !string.IsNullOrEmpty(analysis.Status) ?
+                $"\n[Status filter: {analysis.Status}]" : "";
+
+            var prompt = $@"User asked: ""{userQuery}""
+
+Query Details:
+- Type: {analysis.QueryType}
+- Period: {analysis.DateFrom ?? "N/A"} to {analysis.DateTo ?? "N/A"}
+- Technician filter: {analysis.Technician ?? "none"}
+- Status filter: {analysis.Status ?? "all"}{userRequestNote}{statusNote}
+
+DATA SUMMARY:
+{dataSummary}
+
+{(!string.IsNullOrEmpty(conversationContext) ? $"Previous conversation context:\n{conversationContext}\n" : "")}
+
+Generate a friendly, conversational response:";
 
             var responses = await RunAgentAsync(client, threadId, _conversationAgentId, prompt, instructions);
             var last = responses.LastOrDefault() ?? string.Empty;
 
             // Enhanced fallback if agent run failed
-            if (string.IsNullOrEmpty(last) || last.StartsWith("Agent failed:") || last.StartsWith("Error:"))
+            if (string.IsNullOrEmpty(last) || last.StartsWith("Agent failed:") || last.StartsWith("Error:") || last.StartsWith("Agent timeout"))
             {
-                var failureInfo = last;
-                var bullets = BuildFallbackBulletsFromSummary(dataSummary);
-                var fallback = new StringBuilder();
-                
-                fallback.AppendLine($"I processed your query successfully! Here's what I found:");
-                if (!string.IsNullOrWhiteSpace(failureInfo) && !failureInfo.StartsWith("Agent failed:"))
-                {
-                    fallback.AppendLine($"(Note: {failureInfo.Replace("Error:", string.Empty).Trim()})");
-                }
-                fallback.AppendLine();
-                fallback.AppendLine("Key findings:");
-                foreach (var b in bullets)
-                {
-                    fallback.AppendLine($"• {b}");
-                }
-                fallback.AppendLine();
-                fallback.AppendLine("You can download the full CSV file for detailed analysis. Let me know if you'd like to filter or refine these results further!");
-                return fallback.ToString();
+                return GenerateFallbackConversationalResponse(data, analysis, userQuery, dataSummary);
             }
 
             return last;
         }
 
-        private List<string> BuildFallbackBulletsFromSummary(string summary)
+        private string GenerateFallbackConversationalResponse(object data, QueryAnalysis analysis, string userQuery, string dataSummary)
         {
-            var lines = summary.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            var bullets = new List<string>();
-            foreach (var line in lines)
+            var sb = new StringBuilder();
+            var jsonElement = JsonSerializer.SerializeToElement(data);
+
+            switch (analysis.QueryType)
             {
-                var trimmed = line.Trim();
-                if (trimmed.StartsWith("•"))
-                {
-                    bullets.Add(trimmed.TrimStart('•', ' '));
-                }
-                else if (char.IsDigit(trimmed.FirstOrDefault()) && trimmed.Contains('.'))
-                {
-                    // ranked line like "1. Technician X - 5 requests"
-                    bullets.Add(trimmed); 
-                }
-                else if (trimmed.StartsWith("Found "))
-                {
-                    bullets.Add(trimmed); 
-                }
+                case "request_search":
+                    var reqCount = jsonElement.TryGetProperty("RequestsFound", out var rf) ? rf.GetInt32() : 0;
+                    if (analysis.IsUserTechnician)
+                    {
+                        sb.AppendLine($"You have {reqCount} tickets assigned to you for the selected period.");
+                    }
+                    else if (!string.IsNullOrEmpty(analysis.Technician))
+                    {
+                        sb.AppendLine($"I found {reqCount} tickets assigned to {analysis.Technician}.");
+                    }
+                    else
+                    {
+                        sb.AppendLine($"I found {reqCount} tickets matching your criteria.");
+                    }
+
+                    if (!string.IsNullOrEmpty(analysis.Status))
+                    {
+                        sb.AppendLine($"These are filtered to show only {analysis.Status} tickets.");
+                    }
+
+                    if (jsonElement.TryGetProperty("Requests", out var reqs) && reqs.GetArrayLength() > 0)
+                    {
+                        sb.AppendLine("\nHere are a few of the most recent ones:");
+                        var count = 0;
+                        foreach (var req in reqs.EnumerateArray().Take(5))
+                        {
+                            var subject = req.TryGetProperty("Subject", out var subj) ? subj.GetString() : "No subject";
+                            var status = req.TryGetProperty("Status", out var st) ? st.GetString() : "";
+                            sb.AppendLine($"• {subject} ({status})");
+                            count++;
+                        }
+                    }
+                    break;
+
+                case "top_technicians":
+                    var techCount = jsonElement.TryGetProperty("TotalTechnicians", out var tc) ? tc.GetInt32() : 0;
+                    var totalReqs = jsonElement.TryGetProperty("TotalRequests", out var tr) ? tr.GetInt32() : 0;
+                    sb.AppendLine($"Here's the technician performance breakdown - I found {techCount} technicians who handled {totalReqs} requests total.");
+
+                    if (jsonElement.TryGetProperty("TopTechnicians", out var techs))
+                    {
+                        sb.AppendLine("\nTop performers:");
+                        var rank = 1;
+                        foreach (var tech in techs.EnumerateArray().Take(5))
+                        {
+                            var name = tech.TryGetProperty("Technician", out var n) ? n.GetString() : "Unknown";
+                            var handled = tech.TryGetProperty("RequestsHandled", out var h) ? h.GetInt32() : 0;
+                            sb.AppendLine($"{rank}. {name} - {handled} requests");
+                            rank++;
+                        }
+                    }
+                    break;
+
+                case "influx_requests":
+                    var influxTotal = jsonElement.TryGetProperty("TotalRequests", out var it) ? it.GetInt32() : 0;
+                    var timeUnit = jsonElement.TryGetProperty("TimeUnit", out var tu) ? tu.GetString() : "hour";
+
+                    if (jsonElement.TryGetProperty("PeakHour", out var peakHour))
+                    {
+                        var peakTime = peakHour.TryGetProperty("DateTime", out var pt) ? pt.GetDateTime() : DateTime.MinValue;
+                        var peakCount = peakHour.TryGetProperty("Count", out var pc) ? pc.GetInt32() : 0;
+                        sb.AppendLine($"I analyzed the request flow and found {influxTotal} total requests. The busiest time was {peakTime:MMM dd} at {peakTime:HH:00} with {peakCount} requests coming in.");
+                    }
+                    else if (jsonElement.TryGetProperty("PeakDay", out var peakDay))
+                    {
+                        var peakDate = peakDay.TryGetProperty("Date", out var pd) ? pd.GetDateTime() : DateTime.MinValue;
+                        var peakCount = peakDay.TryGetProperty("Count", out var pc) ? pc.GetInt32() : 0;
+                        sb.AppendLine($"Looking at daily trends, there were {influxTotal} total requests. The busiest day was {peakDate:MMM dd} with {peakCount} requests.");
+                    }
+                    break;
+
+                case "inactive_technicians":
+                    var inactiveCount = jsonElement.TryGetProperty("TotalInactive", out var ic) ? ic.GetInt32() : 0;
+                    var totalTechs = jsonElement.TryGetProperty("TotalTechnicians", out var tt) ? tt.GetInt32() : 0;
+                    sb.AppendLine($"I found {inactiveCount} technicians who haven't had any activity recently (out of {totalTechs} total).");
+
+                    if (jsonElement.TryGetProperty("InactiveTechnicians", out var inactive))
+                    {
+                        sb.AppendLine("\nMost inactive:");
+                        foreach (var tech in inactive.EnumerateArray().Take(5))
+                        {
+                            var name = tech.TryGetProperty("Technician", out var n) ? n.GetString() : "Unknown";
+                            var days = tech.TryGetProperty("DaysInactive", out var d) ? d.GetInt32() : 0;
+                            sb.AppendLine($"• {name} - {days} days inactive");
+                        }
+                    }
+                    break;
+
+                case "top_request_areas":
+                    var areasCount = jsonElement.TryGetProperty("TotalAreas", out var ac) ? ac.GetInt32() : 0;
+                    sb.AppendLine($"Here are the top request categories:");
+
+                    if (jsonElement.TryGetProperty("TopAreas", out var areas))
+                    {
+                        foreach (var area in areas.EnumerateArray().Take(5))
+                        {
+                            var subject = area.TryGetProperty("Subject", out var s) ? s.GetString() : "Unknown";
+                            var count = area.TryGetProperty("Count", out var c) ? c.GetInt32() : 0;
+                            sb.AppendLine($"• {subject}: {count} requests");
+                        }
+                    }
+                    break;
+
+                default:
+                    sb.AppendLine("I've retrieved the data you requested.");
+                    break;
             }
-            // Ensure at least one bullet
-            if (bullets.Count == 0 && !string.IsNullOrWhiteSpace(summary))
-            {
-                bullets.Add(summary.Length > 180 ? summary[..180] + "..." : summary);
-            }
-            return bullets.Take(10).ToList();
+
+            sb.AppendLine("\nThe full details are available in the CSV file. Let me know if you'd like me to dig deeper into any of these!");
+            return sb.ToString();
         }
 
-        private async Task<QueryAnalysis> FallbackHeuristicAnalysis(string userQuery, string userEmail = "")
+        private async Task<QueryAnalysis> FallbackHeuristicAnalysis(string userQuery, string userEmail = "", string conversationContext = "")
         {
             await Task.Yield();
 
             var query = userQuery.ToLowerInvariant();
+            var now = DateTime.UtcNow;
+            var today = now.Date;
+            var yesterday = today.AddDays(-1);
+
             var analysis = new QueryAnalysis
             {
                 QueryType = "request_search",
@@ -643,11 +859,11 @@ NO markdown code blocks. Plain text with bullet points only.";
             // Determine query type
             if (query.Contains("inactive") || query.Contains("no activity"))
                 analysis.QueryType = "inactive_technicians";
-            else if (query.Contains("influx") || query.Contains("volume") || query.Contains("per hour"))
+            else if (query.Contains("influx") || query.Contains("volume") || query.Contains("per hour") || query.Contains("busiest"))
                 analysis.QueryType = "influx_requests";
-            else if (query.Contains("top tech") || query.Contains("ranking"))
+            else if (query.Contains("top tech") || query.Contains("ranking") || query.Contains("best performing"))
                 analysis.QueryType = "top_technicians";
-            else if (query.Contains("top request") || query.Contains("common request") || query.Contains("top subject"))
+            else if (query.Contains("top request") || query.Contains("common request") || query.Contains("top subject") || query.Contains("categories"))
                 analysis.QueryType = "top_request_areas";
 
             // Status
@@ -657,26 +873,86 @@ NO markdown code blocks. Plain text with bullet points only.";
                 analysis.Status = "closed";
 
             // Personalization
-            if (query.Contains("my requests"))
+            if (query.Contains("my requests") || query.Contains("i opened") || query.Contains("i submitted"))
                 analysis.IsUserRequest = true;
-            if (query.Contains("assigned to me"))
+            if (query.Contains("assigned to me") || query.Contains("my tickets") || query.Contains("i have"))
                 analysis.IsUserTechnician = true;
 
-            // Dates
-            var now = DateTime.UtcNow;
-            var defaultDays = analysis.QueryType switch
+            // Date handling
+            if (query.Contains("yesterday"))
             {
-                "inactive_technicians" => 30,
-                "influx_requests" => 7,
-                "top_request_areas" => 30,
-                "top_technicians" => 30,
-                _ => 30
-            };
-            analysis.DateTo = now.ToString("yyyy-MM-dd HH:mm");
-            analysis.DateFrom = now.AddDays(-defaultDays).ToString("yyyy-MM-dd HH:mm");
+                analysis.DateFrom = yesterday.ToString("yyyy-MM-dd") + " 00:00";
+                analysis.DateTo = yesterday.ToString("yyyy-MM-dd") + " 23:59";
+            }
+            else if (query.Contains("today"))
+            {
+                analysis.DateFrom = today.ToString("yyyy-MM-dd") + " 00:00";
+                analysis.DateTo = today.ToString("yyyy-MM-dd") + " 23:59";
+            }
+            else if (query.Contains("this month"))
+            {
+                var monthStart = new DateTime(now.Year, now.Month, 1);
+                analysis.DateFrom = monthStart.ToString("yyyy-MM-dd") + " 00:00";
+                analysis.DateTo = today.ToString("yyyy-MM-dd") + " 23:59";
+            }
+            else if (query.Contains("this week"))
+            {
+                analysis.DateFrom = today.AddDays(-7).ToString("yyyy-MM-dd") + " 00:00";
+                analysis.DateTo = today.ToString("yyyy-MM-dd") + " 23:59";
+            }
+            else
+            {
+                // Default date range
+                var defaultDays = analysis.QueryType switch
+                {
+                    "inactive_technicians" => 30,
+                    "influx_requests" => 7,
+                    "top_request_areas" => 30,
+                    "top_technicians" => 30,
+                    _ => 30
+                };
+                analysis.DateTo = now.ToString("yyyy-MM-dd HH:mm");
+                analysis.DateFrom = now.AddDays(-defaultDays).ToString("yyyy-MM-dd HH:mm");
+            }
 
             if (analysis.QueryType == "influx_requests")
-                analysis.TimeUnit = query.Contains("hour") ? "hour" : "day";
+                analysis.TimeUnit = query.Contains("day") ? "day" : "hour";
+
+            // Try to extract technician name from query
+            var commonPrefixes = new[] { "assigned to ", "tickets for ", "handled by ", "from " };
+            foreach (var prefix in commonPrefixes)
+            {
+                var idx = query.IndexOf(prefix);
+                if (idx >= 0)
+                {
+                    var remainder = query.Substring(idx + prefix.Length).Trim();
+                    var endIdx = remainder.IndexOfAny(new[] { ' ', '.', ',', '?' });
+                    var name = endIdx > 0 ? remainder.Substring(0, endIdx) : remainder;
+                    if (!string.IsNullOrEmpty(name) && name.Length > 2)
+                    {
+                        analysis.Technician = name;
+                        break;
+                    }
+                }
+            }
+
+            // Parse context for follow-up queries
+            if (!string.IsNullOrEmpty(conversationContext) && (query.Contains("them") || query.Contains("those") || query.Contains("of them")))
+            {
+                // Try to extract previous technician from context
+                var techMatch = System.Text.RegularExpressions.Regex.Match(conversationContext, @"technician=([^,\]]+)");
+                if (techMatch.Success && !string.IsNullOrEmpty(techMatch.Groups[1].Value) && techMatch.Groups[1].Value != "null")
+                {
+                    analysis.Technician = techMatch.Groups[1].Value.Trim();
+                }
+
+                // Try to extract date range from context
+                var dateFromMatch = System.Text.RegularExpressions.Regex.Match(conversationContext, @"period=([^ ]+) to");
+                if (dateFromMatch.Success)
+                {
+                    analysis.DateFrom = dateFromMatch.Groups[1].Value + " 00:00";
+                }
+            }
 
             return analysis;
         }
@@ -694,9 +970,6 @@ NO markdown code blocks. Plain text with bullet points only.";
             };
         }
 
-        // Data retrieval methods remain the same as in your document 1
-        // I'll include the key ones here with enhanced JSON parsing
-
         private async Task<object> GetInactiveTechniciansData(QueryAnalysis analysis)
         {
             var (daysInactive, _) = ParseInactivityPeriod(analysis.InactivityPeriod);
@@ -708,12 +981,14 @@ NO markdown code blocks. Plain text with bullet points only.";
 
             if (analysis.Technicians?.Any() ?? false)
             {
-                query = query.Where(r => analysis.Technicians.Contains(r.TechnicianName, StringComparer.OrdinalIgnoreCase));
+                var techList = analysis.Technicians.Select(t => t.ToLower()).ToList();
+                query = query.Where(r => techList.Contains(r.TechnicianName.ToLower()));
             }
 
             if (!string.IsNullOrEmpty(analysis.Technician))
             {
-                query = query.Where(r => r.TechnicianName.ToLower().Contains(analysis.Technician.ToLower()));
+                var techLower = analysis.Technician.ToLower();
+                query = query.Where(r => r.TechnicianName.ToLower().Contains(techLower));
             }
 
             var allTechActivity = await query
@@ -774,17 +1049,20 @@ NO markdown code blocks. Plain text with bullet points only.";
 
             if (analysis.Technicians?.Any() ?? false)
             {
-                query = query.Where(r => analysis.Technicians.Contains(r.TechnicianName, StringComparer.OrdinalIgnoreCase));
+                var techList = analysis.Technicians.Select(t => t.ToLower()).ToList();
+                query = query.Where(r => techList.Contains(r.TechnicianName.ToLower()));
             }
 
             if (!string.IsNullOrEmpty(analysis.Technician))
             {
-                query = query.Where(r => r.TechnicianName.ToLower().Contains(analysis.Technician.ToLower()));
+                var techLower = analysis.Technician.ToLower();
+                query = query.Where(r => r.TechnicianName.ToLower().Contains(techLower));
             }
 
             if (!string.IsNullOrEmpty(analysis.Requester))
             {
-                query = query.Where(r => r.RequesterName.ToLower().Contains(analysis.Requester.ToLower()));
+                var reqLower = analysis.Requester.ToLower();
+                query = query.Where(r => r.RequesterName.ToLower().Contains(reqLower));
             }
 
             var allRequests = await query
@@ -797,7 +1075,6 @@ NO markdown code blocks. Plain text with bullet points only.";
                     .GroupBy(r => new { Date = r.CreatedTime.Date, Hour = r.CreatedTime.Hour })
                     .Select(g => new
                     {
-                        // Fixed: properly construct DateTime from Date and Hour
                         DateTime = new DateTime(g.Key.Date.Year, g.Key.Date.Month, g.Key.Date.Day, g.Key.Hour, 0, 0),
                         Count = g.Count(),
                         Requests = g.Select(r => ParseRequestDetails(r.JsonData, r)).ToList()
@@ -857,17 +1134,20 @@ NO markdown code blocks. Plain text with bullet points only.";
 
             if (analysis.Technicians?.Any() ?? false)
             {
-                query = query.Where(r => analysis.Technicians.Contains(r.TechnicianName, StringComparer.OrdinalIgnoreCase));
+                var techList = analysis.Technicians.Select(t => t.ToLower()).ToList();
+                query = query.Where(r => techList.Contains(r.TechnicianName.ToLower()));
             }
 
             if (!string.IsNullOrEmpty(analysis.Technician))
             {
-                query = query.Where(r => r.TechnicianName.ToLower().Contains(analysis.Technician.ToLower()));
+                var techLower = analysis.Technician.ToLower();
+                query = query.Where(r => r.TechnicianName.ToLower().Contains(techLower));
             }
 
             if (!string.IsNullOrEmpty(analysis.Requester))
             {
-                query = query.Where(r => r.RequesterName.ToLower().Contains(analysis.Requester.ToLower()));
+                var reqLower = analysis.Requester.ToLower();
+                query = query.Where(r => r.RequesterName.ToLower().Contains(reqLower));
             }
 
             var topAreas = await query
@@ -924,17 +1204,20 @@ NO markdown code blocks. Plain text with bullet points only.";
 
             if (analysis.Technicians?.Any() ?? false)
             {
-                query = query.Where(r => analysis.Technicians.Contains(r.TechnicianName, StringComparer.OrdinalIgnoreCase));
+                var techList = analysis.Technicians.Select(t => t.ToLower()).ToList();
+                query = query.Where(r => techList.Contains(r.TechnicianName.ToLower()));
             }
 
             if (!string.IsNullOrEmpty(analysis.Technician))
             {
-                query = query.Where(r => r.TechnicianName.ToLower().Contains(analysis.Technician.ToLower()));
+                var techLower = analysis.Technician.ToLower();
+                query = query.Where(r => r.TechnicianName.ToLower().Contains(techLower));
             }
 
             if (!string.IsNullOrEmpty(analysis.Requester))
             {
-                query = query.Where(r => r.RequesterName.ToLower().Contains(analysis.Requester.ToLower()));
+                var reqLower = analysis.Requester.ToLower();
+                query = query.Where(r => r.RequesterName.ToLower().Contains(reqLower));
             }
 
             if (!string.IsNullOrEmpty(analysis.Status))
@@ -950,7 +1233,8 @@ NO markdown code blocks. Plain text with bullet points only.";
                     TechnicianEmail = g.Select(r => r.TechnicianEmail).FirstOrDefault(e => !string.IsNullOrEmpty(e)),
                     RequestsHandled = g.Count(),
                     AllRequests = g.OrderByDescending(r => r.CreatedTime)
-                                     .Select(r => new {
+                                     .Select(r => new
+                                     {
                                          r.Id,
                                          r.DisplayId,
                                          r.Subject,
@@ -991,6 +1275,9 @@ NO markdown code blocks. Plain text with bullet points only.";
             };
         }
 
+        /// <summary>
+        /// FIXED: Search requests using JsonData contains for proper technician email matching
+        /// </summary>
         private async Task<object> GetRequestSearchData(QueryAnalysis analysis, string userEmail = "")
         {
             var dateFrom = ParseDateTime(analysis.DateFrom) ?? DateTimeOffset.UtcNow.AddDays(-30).DateTime;
@@ -1005,45 +1292,93 @@ NO markdown code blocks. Plain text with bullet points only.";
                 query = ApplyStatusFilter(query, analysis.Status);
             }
 
-            // Enhanced personalization filtering
-            if (analysis.IsUserRequest && !string.IsNullOrEmpty(userEmail))
+            // FIXED: Enhanced personalization filtering - search in JsonData
+            if (analysis.IsUserTechnician && !string.IsNullOrEmpty(userEmail))
             {
-                query = query.Where(r => r.RequesterEmail == userEmail);
+                // Search for technician email in JsonData column as well as TechnicianEmail column
+                query = query.Where(r =>
+                    r.TechnicianEmail == userEmail ||
+                    r.JsonData.Contains($"\"email_id\":\"{userEmail}\"") ||
+                    r.JsonData.Contains(userEmail)
+                );
             }
-            else if (analysis.IsUserTechnician && !string.IsNullOrEmpty(userEmail))
+            else if (analysis.IsUserRequest && !string.IsNullOrEmpty(userEmail))
             {
-                query = query.Where(r => r.TechnicianEmail == userEmail);
+                // Search for requester email in JsonData column as well as RequesterEmail column
+                query = query.Where(r =>
+                    r.RequesterEmail == userEmail ||
+                    r.JsonData.Contains($"\"email_id\":\"{userEmail}\"") ||
+                    r.JsonData.Contains(userEmail)
+                );
             }
             else
             {
-                // Apply technician filters
+                // Apply technician filters - also search in JsonData
                 if (analysis.Technicians?.Any() ?? false)
                 {
-                    query = query.Where(r => analysis.Technicians.Contains(r.TechnicianName, StringComparer.OrdinalIgnoreCase));
+                    var techList = analysis.Technicians.Select(t => t.ToLower()).ToList();
+                    query = query.Where(r =>
+                        techList.Any(t => r.TechnicianName.ToLower().Contains(t)) ||
+                        techList.Any(t => r.JsonData.ToLower().Contains(t))
+                    );
                 }
+
                 if (!string.IsNullOrEmpty(analysis.Technician))
                 {
-                    query = query.Where(r => r.TechnicianName.ToLower().Contains(analysis.Technician.ToLower()));
+                    var techLower = analysis.Technician.ToLower();
+                    query = query.Where(r =>
+                        r.TechnicianName.ToLower().Contains(techLower) ||
+                        r.JsonData.ToLower().Contains(techLower)
+                    );
                 }
-                
+
                 // Apply requester filter
                 if (!string.IsNullOrEmpty(analysis.Requester))
                 {
-                    query = query.Where(r => r.RequesterName.ToLower().Contains(analysis.Requester.ToLower()) || 
-                                             r.RequesterEmail.ToLower().Contains(analysis.Requester.ToLower()));
+                    var reqLower = analysis.Requester.ToLower();
+                    query = query.Where(r =>
+                        r.RequesterName.ToLower().Contains(reqLower) ||
+                        r.RequesterEmail.ToLower().Contains(reqLower) ||
+                        r.JsonData.ToLower().Contains(reqLower)
+                    );
                 }
             }
 
             // Filter by subject if specified
             if (!string.IsNullOrEmpty(analysis.Subject))
             {
-                query = query.Where(r => r.Subject.ToLower().Contains(analysis.Subject.ToLower()));
+                var subjLower = analysis.Subject.ToLower();
+                query = query.Where(r => r.Subject.ToLower().Contains(subjLower));
             }
 
             var requests = await query
                 .OrderByDescending(r => r.CreatedTime)
-                .Take(analysis.TopN ?? 100)
+                .Take(analysis.TopN ?? 500) // Increased limit to get more results
                 .ToListAsync();
+
+            // Post-process to verify technician match when filtering by user email
+            if (analysis.IsUserTechnician && !string.IsNullOrEmpty(userEmail))
+            {
+                requests = requests.Where(r =>
+                {
+                    // Check direct column match
+                    if (r.TechnicianEmail?.Equals(userEmail, StringComparison.OrdinalIgnoreCase) == true)
+                        return true;
+
+                    // Check JsonData for technician email
+                    if (!string.IsNullOrEmpty(r.JsonData))
+                    {
+                        try
+                        {
+                            var data = JsonSerializer.Deserialize<ManageEngineRequestData>(r.JsonData);
+                            if (data?.Technician?.EmailId?.Equals(userEmail, StringComparison.OrdinalIgnoreCase) == true)
+                                return true;
+                        }
+                        catch { }
+                    }
+                    return false;
+                }).ToList();
+            }
 
             var detailedRequests = requests.Select(r => ParseRequestDetails(r.JsonData, r)).ToList();
 
@@ -1058,6 +1393,7 @@ NO markdown code blocks. Plain text with bullet points only.";
                 Status = analysis.Status,
                 IsUserRequest = analysis.IsUserRequest,
                 IsUserTechnician = analysis.IsUserTechnician,
+                UserEmail = userEmail,
                 RequestsFound = detailedRequests.Count,
                 Requests = detailedRequests,
                 Timestamp = DateTime.UtcNow
@@ -1074,6 +1410,7 @@ NO markdown code blocks. Plain text with bullet points only.";
                     r.Status.ToLower() == "open" ||
                     r.Status.ToLower() == "in progress" ||
                     r.Status.ToLower() == "pending" ||
+                    r.Status.ToLower().Contains("open") ||
                     r.JsonData.Contains("\"internal_name\":\"Open\"") ||
                     r.JsonData.Contains("\"internal_name\":\"In Progress\"") ||
                     r.JsonData.Contains("\"internal_name\":\"Pending\"")
@@ -1085,6 +1422,7 @@ NO markdown code blocks. Plain text with bullet points only.";
                     r.Status.ToLower() == "closed" ||
                     r.Status.ToLower() == "resolved" ||
                     r.Status.ToLower() == "completed" ||
+                    r.Status.ToLower().Contains("closed") ||
                     r.JsonData.Contains("\"internal_name\":\"Closed\"") ||
                     r.JsonData.Contains("\"internal_name\":\"Resolved\"") ||
                     r.JsonData.Contains("\"internal_name\":\"Completed\"")
@@ -1098,14 +1436,14 @@ NO markdown code blocks. Plain text with bullet points only.";
         {
             if (string.IsNullOrEmpty(internalStatus)) return false;
             var lower = internalStatus.ToLower();
-            return lower == "open" || lower == "in progress" || lower == "pending";
+            return lower == "open" || lower == "in progress" || lower == "pending" || lower.Contains("open");
         }
 
         private bool IsClosedStatus(string internalStatus)
         {
             if (string.IsNullOrEmpty(internalStatus)) return false;
             var lower = internalStatus.ToLower();
-            return lower == "closed" || lower == "resolved" || lower == "completed";
+            return lower == "closed" || lower == "resolved" || lower == "completed" || lower.Contains("closed");
         }
 
         private dynamic ParseRequestDetails(string jsonData, dynamic basicRequest)
@@ -1189,29 +1527,43 @@ NO markdown code blocks. Plain text with bullet points only.";
             switch (analysis.QueryType)
             {
                 case "inactive_technicians":
+                    var inactiveCount = jsonElement.GetProperty("TotalInactive").GetInt32();
+                    var totalTechs = jsonElement.GetProperty("TotalTechnicians").GetInt32();
+                    sb.AppendLine($"Found {inactiveCount} inactive technicians out of {totalTechs} total.");
+
                     var inactive = jsonElement.GetProperty("InactiveTechnicians").EnumerateArray().Take(10).ToList();
-                    sb.AppendLine($"Found {jsonElement.GetProperty("TotalInactive").GetInt32()} inactive technicians out of {jsonElement.GetProperty("TotalTechnicians").GetInt32()} total.");
-                    sb.AppendLine("Top 10:");
-                    foreach (var tech in inactive)
+                    if (inactive.Any())
                     {
-                        sb.AppendLine($"• {tech.GetProperty("Technician").GetString()} - Last active {tech.GetProperty("DaysInactive").GetInt32()} days ago");
+                        sb.AppendLine("Top inactive:");
+                        foreach (var tech in inactive)
+                        {
+                            sb.AppendLine($"• {tech.GetProperty("Technician").GetString()} - {tech.GetProperty("DaysInactive").GetInt32()} days inactive");
+                        }
                     }
                     break;
 
                 case "top_technicians":
                     var topTechs = jsonElement.GetProperty("TopTechnicians").EnumerateArray().Take(10).ToList();
-                    sb.AppendLine($"Top {topTechs.Count} technicians:");
+                    var totalReqs = jsonElement.GetProperty("TotalRequests").GetInt32();
+                    sb.AppendLine($"Top {topTechs.Count} technicians handled {totalReqs} total requests:");
+
                     int rank = 1;
                     foreach (var tech in topTechs)
                     {
-                        sb.AppendLine($"{rank}. {tech.GetProperty("Technician").GetString()} - {tech.GetProperty("RequestsHandled").GetInt32()} requests (Open: {tech.GetProperty("OpenRequests").GetInt32()}, Closed: {tech.GetProperty("ClosedRequests").GetInt32()})");
+                        var name = tech.GetProperty("Technician").GetString();
+                        var handled = tech.GetProperty("RequestsHandled").GetInt32();
+                        var open = tech.GetProperty("OpenRequests").GetInt32();
+                        var closed = tech.GetProperty("ClosedRequests").GetInt32();
+                        sb.AppendLine($"{rank}. {name} - {handled} requests (Open: {open}, Closed: {closed})");
                         rank++;
                     }
                     break;
 
                 case "top_request_areas":
                     var topAreas = jsonElement.GetProperty("TopAreas").EnumerateArray().Take(10).ToList();
-                    sb.AppendLine($"Top {topAreas.Count} categories:");
+                    var areasTotal = jsonElement.GetProperty("TotalRequests").GetInt32();
+                    sb.AppendLine($"Top {topAreas.Count} categories ({areasTotal} total requests):");
+
                     foreach (var area in topAreas)
                     {
                         sb.AppendLine($"• {area.GetProperty("Subject").GetString()}: {area.GetProperty("Count").GetInt32()} requests");
@@ -1219,22 +1571,49 @@ NO markdown code blocks. Plain text with bullet points only.";
                     break;
 
                 case "influx_requests":
+                    var influxTotal = jsonElement.GetProperty("TotalRequests").GetInt32();
                     if (jsonElement.TryGetProperty("HourlyData", out var hourly))
                     {
                         var peak = jsonElement.GetProperty("PeakHour");
-                        sb.AppendLine($"Request influx by hour. Total: {jsonElement.GetProperty("TotalRequests").GetInt32()}");
-                        sb.AppendLine($"Peak: {peak.GetProperty("DateTime").GetDateTime():MMM dd HH:00} with {peak.GetProperty("Count").GetInt32()} requests");
+                        var peakTime = peak.GetProperty("DateTime").GetDateTime();
+                        var peakCount = peak.GetProperty("Count").GetInt32();
+                        sb.AppendLine($"Request influx by hour. Total: {influxTotal}");
+                        sb.AppendLine($"Peak: {peakTime:MMM dd} at {peakTime:HH:00} with {peakCount} requests");
+
+                        // Show hourly breakdown
+                        sb.AppendLine("\nHourly breakdown:");
+                        foreach (var h in hourly.EnumerateArray().Take(24))
+                        {
+                            var dt = h.GetProperty("DateTime").GetDateTime();
+                            var cnt = h.GetProperty("Count").GetInt32();
+                            sb.AppendLine($"• {dt:MMM dd HH:00}: {cnt} requests");
+                        }
                     }
-                    else
+                    else if (jsonElement.TryGetProperty("DailyData", out var daily))
                     {
                         var peak = jsonElement.GetProperty("PeakDay");
-                        sb.AppendLine($"Request influx by day. Total: {jsonElement.GetProperty("TotalRequests").GetInt32()}");
-                        sb.AppendLine($"Peak: {peak.GetProperty("Date").GetDateTime():MMM dd} with {peak.GetProperty("Count").GetInt32()} requests");
+                        var peakDate = peak.GetProperty("Date").GetDateTime();
+                        var peakCount = peak.GetProperty("Count").GetInt32();
+                        sb.AppendLine($"Request influx by day. Total: {influxTotal}");
+                        sb.AppendLine($"Peak: {peakDate:MMM dd} with {peakCount} requests");
                     }
                     break;
 
                 case "request_search":
-                    sb.AppendLine($"Found {jsonElement.GetProperty("RequestsFound").GetInt32()} matching requests");
+                    var reqFound = jsonElement.GetProperty("RequestsFound").GetInt32();
+                    sb.AppendLine($"Found {reqFound} matching requests.");
+
+                    if (jsonElement.TryGetProperty("Requests", out var reqs) && reqs.GetArrayLength() > 0)
+                    {
+                        sb.AppendLine("\nSample requests:");
+                        foreach (var req in reqs.EnumerateArray().Take(5))
+                        {
+                            var subj = req.TryGetProperty("Subject", out var s) ? s.GetString() : "";
+                            var status = req.TryGetProperty("Status", out var st) ? st.GetString() : "";
+                            var tech = req.TryGetProperty("TechnicianName", out var t) ? t.GetString() : "";
+                            sb.AppendLine($"• {subj} | Status: {status} | Tech: {tech}");
+                        }
+                    }
                     break;
             }
 
@@ -1356,7 +1735,7 @@ NO markdown code blocks. Plain text with bullet points only.";
         }
 
         /// <summary>
-        /// Helper method to run an agent and get responses (re-added after accidental removal)
+        /// Run an agent with proper error handling and retry logic
         /// </summary>
         private async Task<List<string>> RunAgentAsync(
             PersistentAgentsClient client,
@@ -1366,76 +1745,93 @@ NO markdown code blocks. Plain text with bullet points only.";
             string additionalInstructions)
         {
             var responses = new List<string>();
-            try
+            int maxRetries = 3;
+            int currentRetry = 0;
+
+            while (currentRetry < maxRetries)
             {
-                await client.Messages.CreateMessageAsync(threadId, MessageRole.User, userMessage);
-
-                // Use the overload without CreateRunOptions to avoid unsupported parameters like temperature
-                var runResponse = await client.Runs.CreateRunAsync(threadId, agentId, additionalInstructions: additionalInstructions);
-
-                var run = runResponse.Value;
-
-                var start = DateTime.UtcNow;
-                var maxDuration = TimeSpan.FromSeconds(75);
-                while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress || run.Status == RunStatus.RequiresAction)
+                try
                 {
-                    if (DateTime.UtcNow - start > maxDuration)
-                    {
-                        responses.Add("Agent timeout while waiting for completion.");
-                        Console.WriteLine($"Agent run timeout after {(DateTime.UtcNow-start).TotalSeconds:F1}s. Status: {run.Status}");
-                        break;
-                    }
-                    await Task.Delay(750);
-                    run = (await client.Runs.GetRunAsync(threadId, run.Id)).Value;
-                    if (run.Status == RunStatus.RequiresAction)
-                    {
-                        responses.Add("Agent requires an action that this server does not implement.");
-                        Console.WriteLine("Run requires action; exiting polling loop.");
-                        break;
-                    }
-                }
+                    // Add message to thread
+                    await client.Messages.CreateMessageAsync(threadId, MessageRole.User, userMessage);
 
-                if (run.Status == RunStatus.Failed)
-                {
-                    responses.Add($"Agent failed: {run.LastError?.Message ?? "Unknown error"}");
+                    // Create and run the agent
+                    var runResponse = await client.Runs.CreateRunAsync(threadId, agentId, additionalInstructions: additionalInstructions);
+                    var run = runResponse.Value;
+
+                    // Poll for completion
+                    var start = DateTime.UtcNow;
+                    var maxDuration = TimeSpan.FromSeconds(75);
+
+                    while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress || run.Status == RunStatus.RequiresAction)
+                    {
+                        if (DateTime.UtcNow - start > maxDuration)
+                        {
+                            responses.Add("Agent timeout while waiting for completion.");
+                            Console.WriteLine($"Agent run timeout after {(DateTime.UtcNow - start).TotalSeconds:F1}s. Status: {run.Status}");
+                            return responses;
+                        }
+
+                        await Task.Delay(750);
+                        run = (await client.Runs.GetRunAsync(threadId, run.Id)).Value;
+
+                        if (run.Status == RunStatus.RequiresAction)
+                        {
+                            responses.Add("Agent requires an action that this server does not implement.");
+                            Console.WriteLine("Run requires action; exiting polling loop.");
+                            return responses;
+                        }
+                    }
+
+                    if (run.Status == RunStatus.Failed)
+                    {
+                        responses.Add($"Agent failed: {run.LastError?.Message ?? "Unknown error"}");
+                        return responses;
+                    }
+
+                    // Get the response messages
+                    var messagesAsync = client.Messages.GetMessagesAsync(threadId, order: ListSortOrder.Descending);
+                    await foreach (var message in messagesAsync)
+                    {
+                        if (message.Role == MessageRole.Agent)
+                        {
+                            foreach (var content in message.ContentItems)
+                            {
+                                if (content is MessageTextContent textContent)
+                                {
+                                    responses.Add(textContent.Text);
+                                }
+                            }
+                            break;
+                        }
+                    }
+
                     return responses;
                 }
-
-                if (responses.Count > 0 && responses.Last().StartsWith("Agent timeout"))
+                catch (RequestFailedException rfe) when (rfe.Message.Contains("while a run") && rfe.Message.Contains("is active"))
                 {
-                    return responses; // skip collecting messages on timeout
+                    // Thread is busy with another run, wait and retry
+                    currentRetry++;
+                    Console.WriteLine($"Thread busy, waiting before retry {currentRetry}/{maxRetries}...");
+                    await Task.Delay(2000 * currentRetry); // Exponential backoff
+
+                    // Wait for active runs to complete
+                    await WaitForActiveRunsToComplete(client, threadId);
                 }
-
-                var messagesAsync = client.Messages.GetMessagesAsync(threadId, order: ListSortOrder.Descending);
-                await foreach (var message in messagesAsync)
+                catch (Exception ex)
                 {
-                    if (message.Role == MessageRole.Agent)
-                    {
-                        foreach (var content in message.ContentItems)
-                        {
-                            if (content is MessageTextContent textContent)
-                            {
-                                responses.Add(textContent.Text);
-                            }
-                        }
-                        break;
-                    }
+                    Console.WriteLine($"Agent execution error: {ex.Message}");
+                    responses.Add($"Error: {ex.Message}");
+                    return responses;
                 }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Agent execution error: {ex.Message}");
-                responses.Add($"Error: {ex.Message}");
-            }
+
+            responses.Add("Failed after maximum retries due to busy thread.");
             return responses;
         }
 
-        // Continue with helper methods for Zoho API, CSV generation, etc.
-        // These remain the same as in your original code
-
         private async Task<List<Dictionary<string, object>>> FetchRequestsForDateRange(DateTimeOffset dateFrom, DateTimeOffset dateTo)
         {
-            // Implementation remains the same as document 1
             var apiClient = _httpClientFactory.CreateClient();
             apiClient.Timeout = TimeSpan.FromSeconds(60);
             string accessToken = await GetAccessTokenAsync();
@@ -1790,7 +2186,7 @@ NO markdown code blocks. Plain text with bullet points only.";
         }
     }
 
-    // Helper Classes (same as document 1)
+    // Helper Classes
     public class NaturalQueryRequest
     {
         public string Query { get; set; }
@@ -1840,7 +2236,7 @@ NO markdown code blocks. Plain text with bullet points only.";
         public string Status { get; set; }
     }
 
-    // Data models (same as document 1)
+    // Data models
     public class ManageEngineRequestData
     {
         [JsonPropertyName("status")]
