@@ -208,6 +208,27 @@ namespace documentchecker.Controllers
                     var queryAnalysis = await AnalyzeQueryWithAgent(agentsClient, threadId, request.Query, conversationContext, request.UserEmail);
                     Console.WriteLine($"Query Analysis: {JsonSerializer.Serialize(queryAnalysis)}");
 
+                    // STEP 1.5: Handle conversational queries (greetings, help, etc.)
+                    if (queryAnalysis.QueryType == "conversational" || queryAnalysis.IsConversational)
+                    {
+                        var conversationalResponse = GenerateConversationalGreetingResponse(queryAnalysis.ConversationalIntent);
+
+                        var agentMessage = new ChatMessage
+                        {
+                            Role = "agent",
+                            Content = JsonSerializer.Serialize(new { ConversationalResponse = conversationalResponse, QueryAnalysis = queryAnalysis })
+                        };
+                        conversation.Messages.Add(agentMessage);
+                        await _dbContext.SaveChangesAsync();
+
+                        return Ok(new
+                        {
+                            SessionId = sessionId,
+                            ThreadId = threadId,
+                            ConversationalResponse = conversationalResponse
+                        });
+                    }
+
                     // STEP 2: Retrieve data from database based on analysis
                     var retrievedData = await RetrieveDataBasedOnAnalysis(queryAnalysis, request.UserEmail);
 
@@ -231,7 +252,7 @@ namespace documentchecker.Controllers
                     await WaitForActiveRunsToComplete(agentsClient, threadId);
 
                     // STEP 4: Conversation Agent - Generate friendly response
-                    var conversationalResponse = await GenerateConversationalResponseWithAgent(
+                    var conversationalResponseData = await GenerateConversationalResponseWithAgent(
                         agentsClient,
                         threadId,
                         request.Query,
@@ -248,7 +269,7 @@ namespace documentchecker.Controllers
                     {
                         SessionId = sessionId,
                         ThreadId = threadId,
-                        ConversationalResponse = conversationalResponse,
+                        ConversationalResponse = conversationalResponseData,
                         ExcelFile = new
                         {
                             FileName = fileName,
@@ -258,19 +279,19 @@ namespace documentchecker.Controllers
                         QueryAnalysis = queryAnalysis
                     };
 
-                    var agentMessage = new ChatMessage
+                    var agentMessageData = new ChatMessage
                     {
                         Role = "agent",
                         Content = JsonSerializer.Serialize(finalResponseFull)
                     };
-                    conversation.Messages.Add(agentMessage);
+                    conversation.Messages.Add(agentMessageData);
                     await _dbContext.SaveChangesAsync();
 
                     return Ok(new
                     {
                         SessionId = sessionId,
                         ThreadId = threadId,
-                        ConversationalResponse = conversationalResponse,
+                        ConversationalResponse = conversationalResponseData,
                         ExcelFile = finalResponseFull.ExcelFile,
                         Summary = ExtractSummaryFromData(retrievedData, queryAnalysis)
                     });
@@ -289,6 +310,112 @@ namespace documentchecker.Controllers
                     ConversationalResponse = "I apologize, but I encountered an issue processing your request. Could you please rephrase your question?"
                 });
             }
+        }
+
+        /// <summary>
+        /// Generate conversational responses for greetings, help requests, etc.
+        /// </summary>
+        private string GenerateConversationalGreetingResponse(string intent)
+        {
+            return intent?.ToLower() switch
+            {
+                "greeting" => @"Hello! 👋 I'm KIRA, your AI Desk Assistant. I can help you with your IT service desk data.
+
+Here's what I can do for you:
+
+**📋 Search & Find Tickets**
+- ""Show me requests with subject containing 'error' from last week""
+- ""Find tickets assigned to John""
+- ""What open tickets do we have today?""
+
+**👥 Technician Analytics**
+- ""Who are the top performing technicians this month?""
+- ""Show technicians with no activity in the last 14 days""
+- ""How many tickets does Sarah have?""
+
+**📈 Request Volume & Trends**
+- ""What hour had the most requests yesterday?""
+- ""Show me the daily request volume for this week""
+
+**🔍 Personal Queries**
+- ""What tickets are assigned to me?""
+- ""Show my open tickets""
+
+Just type your question naturally, and I'll help you find the information you need! What would you like to know?",
+
+                "help" => @"I'm here to help! Here's a complete guide to what I can do:
+
+**📊 Request Searches**
+You can search for tickets using various filters:
+- By subject: ""Show requests with 'password' in the subject""
+- By date: ""Tickets from October 1st to October 15th""
+- By status: ""Show me all open requests"" or ""closed tickets this week""
+- By technician: ""Requests assigned to Akinola""
+- By requester: ""Tickets submitted by John""
+
+**👥 Technician Analytics**
+- ""Top 10 technicians by tickets handled this month""
+- ""Which technicians have been inactive for 2 weeks?""
+- ""How many tickets does [name] have?""
+- ""Show technician performance ranking""
+
+**📈 Volume Analysis**
+- ""What day had the most requests this month?""
+- ""Show hourly request influx for yesterday""
+- ""When is our busiest time?""
+
+**🔍 Personal Queries**
+- ""What tickets are assigned to me?""
+- ""Show requests I submitted""
+- ""My open tickets""
+
+**💡 Tips**
+- I understand natural language - just ask like you would ask a colleague
+- You can ask follow-up questions like ""how many of those are open?""
+- Results can be downloaded as CSV files
+
+What would you like to explore?",
+
+                "thanks" or "thank_you" => "You're welcome! 😊 I'm glad I could help. Feel free to ask if you need anything else - I'm always here to assist with your service desk queries!",
+
+                "farewell" or "goodbye" => "Goodbye! 👋 Feel free to come back anytime you need help with your service desk data. Have a great day!",
+
+                "capabilities" => @"Here's everything I can help you with:
+
+**🔍 Data Queries**
+1. **Request Search** - Find tickets by subject, date, status, technician, or requester
+2. **Top Technicians** - See who's handling the most requests
+3. **Inactive Technicians** - Find technicians with no recent activity
+4. **Request Volume** - Analyze request influx by hour or day
+5. **Top Request Areas** - See the most common request categories
+
+**📊 Sample Queries**
+- ""Show me requests with 'error' from last week""
+- ""Top 5 technicians this month""
+- ""Inactive technicians for 14 days""
+- ""Busiest hour yesterday""
+- ""My assigned tickets""
+
+**📁 Export**
+All results can be downloaded as CSV files with full details.
+
+What would you like to explore?",
+
+                "unclear" or _ => @"I'm not quite sure what you're looking for. Could you be more specific?
+
+Here are some things I can help with:
+
+- **Search requests** - ""Show requests with 'error' in subject from last week""
+- **Technician stats** - ""Top technicians this month"" or ""inactive technicians""
+- **Request volume** - ""Busiest hour yesterday"" or ""daily request count""
+- **Your tickets** - ""Tickets assigned to me"" or ""my open requests""
+
+You can also say:
+- ""help"" - to see all my capabilities
+- ""what can you do"" - for a full feature list
+
+What would you like to know?"
+            };
         }
 
         /// <summary>
@@ -443,7 +570,7 @@ namespace documentchecker.Controllers
             var yesterdayDate = yesterday.ToString("yyyy-MM-dd");
             var currentTime = now.ToString("HH:mm");
 
-            var instructions = $@"You are a query analysis agent for an IT service desk system.
+            var instructions = $@"You are a query analysis agent for an IT service desk system named KIRA.
 
 CRITICAL: Today's date is {currentDate}. Yesterday was {yesterdayDate}. Current time is {currentTime} UTC.
 This month started on {thisMonthStart:yyyy-MM-dd}.
@@ -452,7 +579,9 @@ Your task: Analyze the user query and return ONLY a valid JSON object with NO ex
 
 Schema:
 {{
-  ""queryType"": ""inactive_technicians|influx_requests|top_request_areas|top_technicians|request_search"",
+  ""queryType"": ""conversational|inactive_technicians|influx_requests|top_request_areas|top_technicians|request_search"",
+  ""isConversational"": boolean,
+  ""conversationalIntent"": ""greeting|help|thanks|farewell|capabilities|unclear|null"",
   ""dateFrom"": ""yyyy-MM-dd HH:mm or null"",
   ""dateTo"": ""yyyy-MM-dd HH:mm or null"",
   ""timeUnit"": ""hour|day or null"",
@@ -467,12 +596,24 @@ Schema:
   ""status"": ""open|closed|null""
 }}
 
-Query Types:
-1. inactive_technicians - technicians with no activity in period
-2. influx_requests - request volume by hour/day
-3. top_request_areas - most common request subjects
-4. top_technicians - technician performance ranking
-5. request_search - search with filters (DEFAULT for most queries)
+=== CONVERSATIONAL MESSAGES (VERY IMPORTANT - CHECK FIRST) ===
+For greetings, help requests, thanks, or unclear messages, use queryType: ""conversational""
+
+Examples of CONVERSATIONAL queries:
+- ""hello"", ""hi"", ""hey"", ""good morning"" → {{""queryType"": ""conversational"", ""isConversational"": true, ""conversationalIntent"": ""greeting""}}
+- ""help"", ""what can you do"", ""how do you work"", ""?"" → {{""queryType"": ""conversational"", ""isConversational"": true, ""conversationalIntent"": ""help""}}
+- ""thanks"", ""thank you"", ""thx"" → {{""queryType"": ""conversational"", ""isConversational"": true, ""conversationalIntent"": ""thanks""}}
+- ""bye"", ""goodbye"", ""see you"" → {{""queryType"": ""conversational"", ""isConversational"": true, ""conversationalIntent"": ""farewell""}}
+- ""what are your capabilities"", ""features"" → {{""queryType"": ""conversational"", ""isConversational"": true, ""conversationalIntent"": ""capabilities""}}
+- Single words or unclear messages → {{""queryType"": ""conversational"", ""isConversational"": true, ""conversationalIntent"": ""unclear""}}
+
+Query Types (for DATA queries only):
+1. conversational - greetings, help requests, thanks, unclear messages (NO data retrieval)
+2. inactive_technicians - technicians with no activity in period
+3. influx_requests - request volume by hour/day
+4. top_request_areas - most common request subjects
+5. top_technicians - technician performance ranking
+6. request_search - search with filters (DEFAULT for most data queries)
 
 === DATE PARSING RULES (CRITICAL) ===
 - 'today' → {currentDate} 00:00 to {currentDate} 23:59
@@ -501,17 +642,26 @@ ALWAYS preserve relevant filters from context for follow-up questions.
 
 === EXAMPLES ===
 
+Query: ""hello""
+→ {{""queryType"": ""conversational"", ""isConversational"": true, ""conversationalIntent"": ""greeting"", ""dateFrom"": null, ""dateTo"": null, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}}
+
+Query: ""hi there""
+→ {{""queryType"": ""conversational"", ""isConversational"": true, ""conversationalIntent"": ""greeting"", ""dateFrom"": null, ""dateTo"": null, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}}
+
+Query: ""what can you do""
+→ {{""queryType"": ""conversational"", ""isConversational"": true, ""conversationalIntent"": ""help"", ""dateFrom"": null, ""dateTo"": null, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}}
+
 Query: ""what tickets do i have assigned to me""
-→ {{""queryType"": ""request_search"", ""dateFrom"": ""{today.AddDays(-30):yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""isUserTechnician"": true, ""status"": null, ""technician"": null, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false}}
+→ {{""queryType"": ""request_search"", ""isConversational"": false, ""conversationalIntent"": null, ""dateFrom"": ""{today.AddDays(-30):yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""isUserTechnician"": true, ""status"": null, ""technician"": null, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false}}
 
 Query: ""how many tickets assigned to akinola this month""
-→ {{""queryType"": ""request_search"", ""dateFrom"": ""{thisMonthStart:yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""technician"": ""akinola"", ""status"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null}}
+→ {{""queryType"": ""request_search"", ""isConversational"": false, ""conversationalIntent"": null, ""dateFrom"": ""{thisMonthStart:yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""technician"": ""akinola"", ""status"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null}}
 
 Query: ""how many of them are open"" (after asking about akinola)
-→ {{""queryType"": ""request_search"", ""dateFrom"": ""{thisMonthStart:yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""technician"": ""akinola"", ""status"": ""open"", ""isUserRequest"": false, ""isUserTechnician"": false, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null}}
+→ {{""queryType"": ""request_search"", ""isConversational"": false, ""conversationalIntent"": null, ""dateFrom"": ""{thisMonthStart:yyyy-MM-dd} 00:00"", ""dateTo"": ""{currentDate} 23:59"", ""technician"": ""akinola"", ""status"": ""open"", ""isUserRequest"": false, ""isUserTechnician"": false, ""timeUnit"": null, ""topN"": null, ""subject"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null}}
 
 Query: ""what hour had an influx of requests yesterday""
-→ {{""queryType"": ""influx_requests"", ""dateFrom"": ""{yesterdayDate} 00:00"", ""dateTo"": ""{yesterdayDate} 23:59"", ""timeUnit"": ""hour"", ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}}
+→ {{""queryType"": ""influx_requests"", ""isConversational"": false, ""conversationalIntent"": null, ""dateFrom"": ""{yesterdayDate} 00:00"", ""dateTo"": ""{yesterdayDate} 23:59"", ""timeUnit"": ""hour"", ""topN"": null, ""subject"": null, ""technician"": null, ""technicians"": null, ""requester"": null, ""inactivityPeriod"": null, ""isUserRequest"": false, ""isUserTechnician"": false, ""status"": null}}
 
 Output ONLY the JSON object. No markdown code blocks, no explanations.";
 
@@ -550,6 +700,12 @@ Return ONLY the JSON analysis:";
                         var analysis = JsonSerializer.Deserialize<QueryAnalysis>(response, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                         if (analysis != null && !string.IsNullOrEmpty(analysis.QueryType))
                         {
+                            // If it's conversational, return immediately
+                            if (analysis.QueryType == "conversational" || analysis.IsConversational)
+                            {
+                                return analysis;
+                            }
+
                             // Apply defaults if dates are missing
                             if (string.IsNullOrEmpty(analysis.DateFrom) || string.IsNullOrEmpty(analysis.DateTo))
                             {
@@ -590,6 +746,12 @@ Return ONLY the JSON analysis:";
             string dataSummary,
             string conversationContext)
         {
+            // Skip refinement for conversational queries
+            if (currentAnalysis.QueryType == "conversational" || currentAnalysis.IsConversational)
+            {
+                return null;
+            }
+
             var instructions = @"You are a data retrieval refinement agent.
 
 Review the query analysis and data summary. If the analysis seems correct, respond with: {""status"":""ok""}
@@ -651,7 +813,7 @@ Is this analysis correct? If not, provide improved JSON.";
         {
             var dataSummary = GenerateDataSummary(data, analysis);
 
-            var instructions = @"You are a friendly, helpful IT service desk assistant named AIDA (AI Desk Assistant).
+            var instructions = @"You are a friendly, helpful IT service desk assistant named KIRA (AI Desk Assistant).
 
 Generate a warm, conversational response that feels like talking to a helpful colleague. Follow these guidelines:
 
@@ -821,8 +983,7 @@ Generate a friendly, conversational response:";
 
                     if (jsonElement.TryGetProperty("TopAreas", out var areas))
                     {
-                        foreach (var area in areas.EnumerateArray().Take(5)
-                          )
+                        foreach (var area in areas.EnumerateArray().Take(5))
                         {
                             var subject = area.TryGetProperty("Subject", out var s) ? s.GetString() : "Unknown";
                             var count = area.TryGetProperty("Count", out var c) ? c.GetInt32() : 0;
@@ -844,14 +1005,72 @@ Generate a friendly, conversational response:";
         {
             await Task.Yield();
 
-            var query = userQuery.ToLowerInvariant();
+            var query = userQuery.ToLowerInvariant().Trim();
             var now = DateTime.UtcNow;
             var today = now.Date;
             var yesterday = today.AddDays(-1);
 
+            // Check for conversational intents first
+            var greetings = new[] { "hello", "hi", "hey", "good morning", "good afternoon", "good evening", "howdy", "greetings" };
+            var helpKeywords = new[] { "help", "what can you do", "how do you work", "capabilities", "features", "?" };
+            var thanksKeywords = new[] { "thanks", "thank you", "thx", "ty", "appreciated" };
+            var farewellKeywords = new[] { "bye", "goodbye", "see you", "later", "ciao" };
+
+            if (greetings.Any(g => query == g || query.StartsWith(g + " ") || query.StartsWith(g + "!")))
+            {
+                return new QueryAnalysis
+                {
+                    QueryType = "conversational",
+                    IsConversational = true,
+                    ConversationalIntent = "greeting"
+                };
+            }
+
+            if (helpKeywords.Any(h => query.Contains(h)))
+            {
+                return new QueryAnalysis
+                {
+                    QueryType = "conversational",
+                    IsConversational = true,
+                    ConversationalIntent = "help"
+                };
+            }
+
+            if (thanksKeywords.Any(t => query.Contains(t)))
+            {
+                return new QueryAnalysis
+                {
+                    QueryType = "conversational",
+                    IsConversational = true,
+                    ConversationalIntent = "thanks"
+                };
+            }
+
+            if (farewellKeywords.Any(f => query.Contains(f)))
+            {
+                return new QueryAnalysis
+                {
+                    QueryType = "conversational",
+                    IsConversational = true,
+                    ConversationalIntent = "farewell"
+                };
+            }
+
+            // If query is very short and unclear, treat as conversational
+            if (query.Length < 5 && !query.Contains("ticket") && !query.Contains("request"))
+            {
+                return new QueryAnalysis
+                {
+                    QueryType = "conversational",
+                    IsConversational = true,
+                    ConversationalIntent = "unclear"
+                };
+            }
+
             var analysis = new QueryAnalysis
             {
                 QueryType = "request_search",
+                IsConversational = false,
                 IsUserRequest = false,
                 IsUserTechnician = false,
                 Technicians = new List<string>()
@@ -960,6 +1179,17 @@ Generate a friendly, conversational response:";
 
         private async Task<object> RetrieveDataBasedOnAnalysis(QueryAnalysis analysis, string userEmail = "")
         {
+            // Handle conversational queries - no data retrieval needed
+            if (analysis.QueryType == "conversational" || analysis.IsConversational)
+            {
+                return new
+                {
+                    QueryType = "Conversational",
+                    Intent = analysis.ConversationalIntent ?? "general",
+                    Timestamp = DateTime.UtcNow
+                };
+            }
+
             return analysis.QueryType switch
             {
                 "inactive_technicians" => await GetInactiveTechniciansData(analysis),
@@ -1117,7 +1347,8 @@ Generate a friendly, conversational response:";
                             Subject = r.Subject,
                             Status = r.Status,
                             TechnicianName = r.TechnicianName,
-                            RequesterName = r.RequesterName
+                            RequesterName = r.RequesterName,
+                            CreatedTime = hourGroup.DateTime
                         })).ToList()
                     });
                 }
@@ -1144,7 +1375,7 @@ Generate a friendly, conversational response:";
                     {
                         Date = g.Key,
                         Count = g.Count(),
-                        RequestIds = g.Select(r => (r.Id, r.DisplayId, r.Subject, r.Status, r.TechnicianName, r.RequesterName, r.JsonData)).ToList()
+                        RequestIds = g.Select(r => (r.Id, r.DisplayId, r.Subject, r.Status, r.TechnicianName, r.RequesterName, r.JsonData, r.CreatedTime)).ToList()
                     })
                     .OrderBy(x => x.Date)
                     .ToList();
@@ -1164,7 +1395,8 @@ Generate a friendly, conversational response:";
                             Subject = r.Subject,
                             Status = r.Status,
                             TechnicianName = r.TechnicianName,
-                            RequesterName = r.RequesterName
+                            RequesterName = r.RequesterName,
+                            CreatedTime = r.CreatedTime
                         })).ToList()
                     });
                 }
@@ -1362,7 +1594,7 @@ Generate a friendly, conversational response:";
         }
 
         /// <summary>
-        /// FIXED: Search requests using JsonData contains for proper technician email matching
+        /// Search requests using JsonData contains for proper technician email matching
         /// </summary>
         private async Task<object> GetRequestSearchData(QueryAnalysis analysis, string userEmail = "")
         {
@@ -1378,7 +1610,7 @@ Generate a friendly, conversational response:";
                 query = ApplyStatusFilter(query, analysis.Status);
             }
 
-            // FIXED: Enhanced personalization filtering - search in JsonData
+            // Enhanced personalization filtering - search in JsonData
             if (analysis.IsUserTechnician && !string.IsNullOrEmpty(userEmail))
             {
                 // Search for technician email in JsonData column as well as TechnicianEmail column
@@ -1439,7 +1671,7 @@ Generate a friendly, conversational response:";
 
             var requests = await query
                 .OrderByDescending(r => r.CreatedTime)
-                .Take(analysis.TopN ?? 500) // Increased limit to get more results
+                .Take(analysis.TopN ?? 500)
                 .ToListAsync();
 
             // Post-process to verify technician match when filtering by user email
@@ -1532,19 +1764,49 @@ Generate a friendly, conversational response:";
             return lower == "closed" || lower == "resolved" || lower == "completed" || lower.Contains("closed");
         }
 
+        /// <summary>
+        /// Parse request details from JSON data - COMPREHENSIVE version with all fields
+        /// </summary>
         private dynamic ParseRequestDetails(string jsonData, dynamic basicRequest)
         {
             try
             {
-                var data = JsonSerializer.Deserialize<ManageEngineRequestData>(jsonData);
+                var data = JsonSerializer.Deserialize<ManageEngineRequestData>(jsonData, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+
+                // Strip HTML from description
+                string StripHtml(string html)
+                {
+                    if (string.IsNullOrEmpty(html)) return "";
+                    return System.Text.RegularExpressions.Regex.Replace(html, "<[^>]*>", " ")
+                        .Replace("&nbsp;", " ")
+                        .Replace("&amp;", "&")
+                        .Replace("&lt;", "<")
+                        .Replace("&gt;", ">")
+                        .Replace("  ", " ")
+                        .Trim();
+                }
 
                 return new
                 {
+                    // Core fields
                     Id = basicRequest.Id?.ToString() ?? "",
                     DisplayId = data?.DisplayId ?? basicRequest.DisplayId?.ToString() ?? "",
                     Subject = data?.Subject ?? basicRequest.Subject?.ToString() ?? "",
+                    Description = StripHtml(data?.Description ?? ""),
+
+                    // Status
+                    Status = data?.Status?.Name ?? basicRequest.Status?.ToString() ?? "",
+                    StatusInternal = data?.Status?.InternalName ?? "",
+                    StatusColor = data?.Status?.Color ?? "",
+
+                    // Technician
                     TechnicianName = data?.Technician?.Name ?? basicRequest.TechnicianName?.ToString() ?? "",
                     TechnicianEmail = data?.Technician?.EmailId ?? "",
+
+                    // Requester - COMPREHENSIVE
                     RequesterName = data?.Requester?.Name ?? basicRequest.RequesterName?.ToString() ?? "",
                     RequesterEmail = data?.Requester?.EmailId ?? basicRequest.RequesterEmail?.ToString() ?? "",
                     RequesterPhone = data?.Requester?.Phone ?? "",
@@ -1553,19 +1815,50 @@ Generate a friendly, conversational response:";
                     RequesterSite = data?.Requester?.Site?.Name ?? "",
                     RequesterJobTitle = data?.Requester?.JobTitle ?? "",
                     RequesterEmployeeId = data?.Requester?.EmployeeId ?? "",
-                    Status = data?.Status?.Name ?? basicRequest.Status?.ToString() ?? "",
-                    StatusInternal = data?.Status?.InternalName ?? "",
-                    StatusColor = data?.Status?.Color ?? "",
+
+                    // Timestamps - COMPREHENSIVE
                     CreatedTime = basicRequest.CreatedTime,
-                    CreatedTimeDisplay = data?.CreatedTime?.DisplayValue ?? basicRequest.CreatedTime.ToString(),
+                    CreatedTimeDisplay = data?.CreatedTime?.DisplayValue ?? basicRequest.CreatedTime?.ToString() ?? "",
                     DueByTime = data?.DueByTime?.DisplayValue ?? "",
-                    Template = data?.Template?.Name ?? "",
-                    Group = data?.Group?.Name ?? "",
-                    IsServiceRequest = data?.IsServiceRequest ?? false,
-                    HasNotes = data?.HasNotes ?? false,
-                    Priority = data?.Priority?.Name ?? "",
+                    RespondedDate = data?.RespondedTime?.DisplayValue ?? "",
+                    CompletedDate = data?.CompletedTime?.DisplayValue ?? "",
+                    ResolvedTime = data?.ResolvedTime?.DisplayValue ?? "",
+                    LastUpdatedTime = data?.LastUpdatedTime?.DisplayValue ?? "",
+
+                    // Classification - COMPREHENSIVE
                     Category = data?.Category?.Name ?? "",
                     Subcategory = data?.Subcategory?.Name ?? "",
+                    Item = data?.Item?.Name ?? "",
+                    Priority = data?.Priority?.Name ?? "",
+                    Urgency = data?.Urgency?.Name ?? "",
+                    Impact = data?.Impact?.Name ?? "",
+                    RequestType = data?.RequestType?.Name ?? "",
+                    Level = data?.Level?.Name ?? "",
+                    Mode = data?.Mode?.Name ?? "",
+
+                    // Assignment
+                    Group = data?.Group?.Name ?? "",
+                    Template = data?.Template?.Name ?? "",
+                    Site = data?.Site?.Name ?? "",
+                    Department = data?.Department?.Name ?? "",
+
+                    // Flags
+                    IsServiceRequest = data?.IsServiceRequest ?? false,
+                    HasNotes = data?.HasNotes ?? false,
+                    IsOverdue = data?.IsOverdue ?? false,
+                    IsResponseOverdue = data?.IsFirstResponseOverdue ?? false,
+
+                    // Resolution
+                    Resolution = data?.Resolution?.Content ?? "",
+                    ResolutionSubmittedBy = data?.Resolution?.SubmittedBy ?? "",
+                    ResolutionTime = data?.Resolution?.SubmittedOn?.DisplayValue ?? "",
+
+                    // Audit
+                    CreatedBy = data?.CreatedBy?.Name ?? "",
+                    LastUpdatedBy = data?.LastUpdatedBy?.Name ?? "",
+                    OnBehalfOf = data?.OnBehalfOf?.Name ?? "",
+
+                    // Store full data for any additional fields
                     FullData = data
                 };
             }
@@ -1577,6 +1870,10 @@ Generate a friendly, conversational response:";
                     Id = basicRequest.Id?.ToString() ?? "",
                     DisplayId = basicRequest.DisplayId?.ToString() ?? "",
                     Subject = basicRequest.Subject?.ToString() ?? "",
+                    Description = "",
+                    Status = basicRequest.Status?.ToString() ?? "",
+                    StatusInternal = "",
+                    StatusColor = "",
                     TechnicianName = basicRequest.TechnicianName?.ToString() ?? "",
                     TechnicianEmail = "",
                     RequesterName = basicRequest.RequesterName?.ToString() ?? "",
@@ -1587,19 +1884,36 @@ Generate a friendly, conversational response:";
                     RequesterSite = "",
                     RequesterJobTitle = "",
                     RequesterEmployeeId = "",
-                    Status = basicRequest.Status?.ToString() ?? "",
-                    StatusInternal = "",
-                    StatusColor = "",
                     CreatedTime = basicRequest.CreatedTime,
-                    CreatedTimeDisplay = basicRequest.CreatedTime.ToString(),
+                    CreatedTimeDisplay = basicRequest.CreatedTime?.ToString() ?? "",
                     DueByTime = "",
-                    Template = "",
-                    Group = "",
-                    IsServiceRequest = false,
-                    HasNotes = false,
-                    Priority = "",
+                    RespondedDate = "",
+                    CompletedDate = "",
+                    ResolvedTime = "",
+                    LastUpdatedTime = "",
                     Category = "",
                     Subcategory = "",
+                    Item = "",
+                    Priority = "",
+                    Urgency = "",
+                    Impact = "",
+                    RequestType = "",
+                    Level = "",
+                    Mode = "",
+                    Group = "",
+                    Template = "",
+                    Site = "",
+                    Department = "",
+                    IsServiceRequest = false,
+                    HasNotes = false,
+                    IsOverdue = false,
+                    IsResponseOverdue = false,
+                    Resolution = "",
+                    ResolutionSubmittedBy = "",
+                    ResolutionTime = "",
+                    CreatedBy = "",
+                    LastUpdatedBy = "",
+                    OnBehalfOf = "",
                     FullData = (object)null
                 };
             }
@@ -1607,6 +1921,12 @@ Generate a friendly, conversational response:";
 
         private string GenerateDataSummary(object data, QueryAnalysis analysis)
         {
+            // Handle conversational queries
+            if (analysis.QueryType == "conversational" || analysis.IsConversational)
+            {
+                return $"Conversational intent: {analysis.ConversationalIntent}";
+            }
+
             var jsonElement = JsonSerializer.SerializeToElement(data);
             var sb = new StringBuilder();
 
@@ -2115,6 +2435,9 @@ Generate a friendly, conversational response:";
             return null;
         }
 
+        /// <summary>
+        /// Generate COMPREHENSIVE CSV with all fields from data
+        /// </summary>
         private byte[] GenerateEnhancedCsvFromData(JsonElement data)
         {
             var sb = new StringBuilder();
@@ -2126,8 +2449,13 @@ Generate a friendly, conversational response:";
 
                 switch (type)
                 {
+                    case "Conversational":
+                        sb.AppendLine("Type,Intent,Timestamp");
+                        sb.AppendLine($"\"Conversational\",\"{Safe(data.TryGetProperty("Intent", out var intent) ? intent.GetString() : "")}\",\"{Safe(data.TryGetProperty("Timestamp", out var ts) ? ts.GetString() : "")}\"");
+                        break;
+
                     case "InactiveTechnicians":
-                        sb.AppendLine("Technician,Email,Last Activity,Days Inactive,Total Requests,Request ID,Display ID,Subject,Status,Created Time,Requester,Requester Email,Department,Priority");
+                        sb.AppendLine("Technician,Email,Last Activity,Days Inactive,Total Requests,Request ID,Display ID,Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
                         foreach (var tech in data.GetProperty("InactiveTechnicians").EnumerateArray())
                         {
                             var techName = Safe(tech.GetProperty("Technician").GetString());
@@ -2139,18 +2467,13 @@ Generate a friendly, conversational response:";
                             foreach (var req in tech.GetProperty("Requests").EnumerateArray())
                             {
                                 sb.AppendLine($"\"{techName}\",\"{techEmail}\",\"{lastActivity}\",\"{daysInactive}\",\"{totalReqs}\"," +
-                                    $"\"{Safe(req.GetProperty("Id").GetString())}\",\"{Safe(req.GetProperty("DisplayId").GetString())}\"," +
-                                    $"\"{Safe(req.GetProperty("Subject").GetString())}\",\"{Safe(req.GetProperty("Status").GetString())}\"," +
-                                    $"\"{req.GetProperty("CreatedTime").GetDateTime():yyyy-MM-dd HH:mm}\"," +
-                                    $"\"{Safe(req.GetProperty("RequesterName").GetString())}\",\"{Safe(req.GetProperty("RequesterEmail").GetString())}\"," +
-                                    $"\"{Safe(req.TryGetProperty("RequesterDepartment", out var rd) ? rd.GetString() : "")}\"," +
-                                    $"\"{Safe(req.TryGetProperty("Priority", out var pri) ? pri.GetString() : "")}\"");
+                                    BuildRequestCsvLine(req));
                             }
                         }
                         break;
 
                     case "TopTechnicians":
-                        sb.AppendLine("Rank,Technician,Email,Total Requests,Open Requests,Closed Requests,Request ID,Display ID,Subject,Status,Created Time,Requester,Priority,Category");
+                        sb.AppendLine("Rank,Technician,Email,Total Requests,Open Requests,Closed Requests,Request ID,Display ID,Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
                         int rank = 1;
                         foreach (var tech in data.GetProperty("TopTechnicians").EnumerateArray())
                         {
@@ -2163,19 +2486,14 @@ Generate a friendly, conversational response:";
                             foreach (var req in tech.GetProperty("Requests").EnumerateArray())
                             {
                                 sb.AppendLine($"\"{rank}\",\"{techName}\",\"{techEmail}\",\"{totalReqs}\",\"{openReqs}\",\"{closedReqs}\"," +
-                                    $"\"{Safe(req.GetProperty("Id").GetString())}\",\"{Safe(req.GetProperty("DisplayId").GetString())}\"," +
-                                    $"\"{Safe(req.GetProperty("Subject").GetString())}\",\"{Safe(req.GetProperty("Status").GetString())}\"," +
-                                    $"\"{req.GetProperty("CreatedTime").GetDateTime():yyyy-MM-dd HH:mm}\"," +
-                                    $"\"{Safe(req.GetProperty("RequesterName").GetString())}\"," +
-                                    $"\"{Safe(req.TryGetProperty("Priority", out var pri) ? pri.GetString() : "")}\"," +
-                                    $"\"{Safe(req.TryGetProperty("Category", out var cat) ? cat.GetString() : "")}\"");
+                                    BuildRequestCsvLine(req));
                             }
                             rank++;
                         }
                         break;
 
                     case "TopRequestAreas":
-                        sb.AppendLine("Subject,Total Count,Request ID,Display ID,Status,Created Time,Technician,Requester,Priority");
+                        sb.AppendLine("Subject Area,Total Count,Request ID,Display ID,Request Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Technician,Technician Email,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
                         foreach (var area in data.GetProperty("TopAreas").EnumerateArray())
                         {
                             var subject = Safe(area.GetProperty("Subject").GetString());
@@ -2183,16 +2501,7 @@ Generate a friendly, conversational response:";
 
                             foreach (var req in area.GetProperty("Requests").EnumerateArray())
                             {
-                                sb.AppendLine($"\"{subject}\",\"{count}\"," +
-                                    $"\"{Safe(req.GetProperty("Id").GetString())}\",\"{Safe(req.GetProperty("DisplayId").GetString())}\"," +
-                                    $"\"{Safe(req.GetProperty("Status").GetString())}\"," +
-                                    $"\"{req.GetProperty("CreatedTime").GetDateTime():yyyy-MM-dd HH:mm}\"," +
-                                    $"\"{Safe(req.TryGetProperty("TechnicianName", out var tn) ? tn.GetString() : "")}\"," +
-                                    $"\"{Safe(req.TryGetProperty("TechnicianEmail", out var te) ? te.GetString() : "")}\"," +
-                                    $"\"{Safe(req.GetProperty("RequesterName").GetString())}\"," +
-                                    $"\"{Safe(req.GetProperty("RequesterEmail").GetString())}\"," +
-                                    $"\"{Safe(req.TryGetProperty("RequesterDepartment", out var rd) ? rd.GetString() : "")}\"," +
-                                    $"\"{Safe(req.TryGetProperty("Priority", out var pri) ? pri.GetString() : "")}\"");
+                                sb.AppendLine($"\"{subject}\",\"{count}\"," + BuildRequestCsvLine(req));
                             }
                         }
                         break;
@@ -2200,7 +2509,7 @@ Generate a friendly, conversational response:";
                     case "InfluxRequests":
                         if (data.TryGetProperty("HourlyData", out var hourly))
                         {
-                            sb.AppendLine("DateTime,Hour Count,Request ID,Display ID,Subject,Status,Technician,Requester,Priority");
+                            sb.AppendLine("DateTime,Hour Count,Request ID,Display ID,Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Technician,Technician Email,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
                             foreach (var item in hourly.EnumerateArray())
                             {
                                 var dateTime = item.GetProperty("DateTime").GetDateTime().ToString("yyyy-MM-dd HH:00");
@@ -2208,18 +2517,13 @@ Generate a friendly, conversational response:";
 
                                 foreach (var req in item.GetProperty("Requests").EnumerateArray())
                                 {
-                                    sb.AppendLine($"\"{dateTime}\",\"{count}\"," +
-                                        $"\"{Safe(req.GetProperty("Id").GetString())}\",\"{Safe(req.GetProperty("DisplayId").GetString())}\"," +
-                                        $"\"{Safe(req.GetProperty("Subject").GetString())}\",\"{Safe(req.GetProperty("Status").GetString())}\"," +
-                                        $"\"{Safe(req.TryGetProperty("TechnicianName", out var tn) ? tn.GetString() : "")}\"," +
-                                        $"\"{Safe(req.GetProperty("RequesterName").GetString())}\"," +
-                                        $"\"{Safe(req.TryGetProperty("Priority", out var pri) ? pri.GetString() : "")}\"");
+                                    sb.AppendLine($"\"{dateTime}\",\"{count}\"," + BuildRequestCsvLine(req));
                                 }
                             }
                         }
                         else
                         {
-                            sb.AppendLine("Date,Day Count,Request ID,Display ID,Subject,Status,Technician,Requester,Priority");
+                            sb.AppendLine("Date,Day Count,Request ID,Display ID,Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Technician,Technician Email,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
                             foreach (var item in data.GetProperty("DailyData").EnumerateArray())
                             {
                                 var date = item.GetProperty("Date").GetDateTime().ToString("yyyy-MM-dd");
@@ -2227,38 +2531,17 @@ Generate a friendly, conversational response:";
 
                                 foreach (var req in item.GetProperty("Requests").EnumerateArray())
                                 {
-                                    sb.AppendLine($"\"{date}\",\"{count}\"," +
-                                        $"\"{Safe(req.GetProperty("Id").GetString())}\",\"{Safe(req.GetProperty("DisplayId").GetString())}\"," +
-                                        $"\"{Safe(req.GetProperty("Subject").GetString())}\",\"{Safe(req.GetProperty("Status").GetString())}\"," +
-                                        $"\"{Safe(req.TryGetProperty("TechnicianName", out var tn) ? tn.GetString() : "")}\"," +
-                                        $"\"{Safe(req.GetProperty("RequesterName").GetString())}\"," +
-                                        $"\"{Safe(req.TryGetProperty("Priority", out var pri) ? pri.GetString() : "")}\"");
+                                    sb.AppendLine($"\"{date}\",\"{count}\"," + BuildRequestCsvLine(req));
                                 }
                             }
                         }
                         break;
 
                     case "RequestSearch":
-                        sb.AppendLine("ID,Display ID,Subject,Technician,Technician Email,Requester,Requester Email,Status,Created Time,Department,Site,Priority,Category,Subcategory,Phone,Mobile,Employee ID,Job Title");
+                        sb.AppendLine("Request ID,Display ID,Subject,Description,Status,Status Internal,Created Time,Due By Time,Responded Date,Completed Date,Resolved Time,Last Updated Time,Technician,Technician Email,Requester,Requester Email,Requester Phone,Requester Mobile,Requester Department,Requester Site,Requester Job Title,Requester Employee ID,Category,Subcategory,Item,Priority,Urgency,Impact,Request Type,Level,Mode,Group,Template,Site,Department,Is Service Request,Has Notes,Is Overdue,Is Response Overdue,Resolution,Resolution Submitted By,Resolution Time,Created By,Last Updated By,On Behalf Of");
                         foreach (var r in data.GetProperty("Requests").EnumerateArray())
                         {
-                            sb.AppendLine($"\"{Safe(r.GetProperty("Id").GetString())}\",\"{Safe(r.GetProperty("DisplayId").GetString())}\"," +
-                                $"\"{Safe(r.GetProperty("Subject").GetString())}\"," +
-                                $"\"{Safe(r.GetProperty("TechnicianName").GetString())}\"," +
-                                $"\"{Safe(r.GetProperty("TechnicianEmail").GetString())}\"," +
-                                $"\"{Safe(r.GetProperty("RequesterName").GetString())}\"," +
-                                $"\"{Safe(r.GetProperty("RequesterEmail").GetString())}\"," +
-                                $"\"{Safe(r.GetProperty("Status").GetString())}\"," +
-                                $"\"{r.GetProperty("CreatedTime").GetDateTime():yyyy-MM-dd HH:mm}\"," +
-                                $"\"{Safe(r.TryGetProperty("RequesterDepartment", out var rd) ? rd.GetString() : "")}\"," +
-                                $"\"{Safe(r.TryGetProperty("RequesterSite", out var rs) ? rs.GetString() : "")}\"," +
-                                $"\"{Safe(r.TryGetProperty("Priority", out var pri) ? pri.GetString() : "")}\"," +
-                                $"\"{Safe(r.TryGetProperty("Category", out var cat) ? cat.GetString() : "")}\"," +
-                                $"\"{Safe(r.TryGetProperty("Subcategory", out var sub) ? sub.GetString() : "")}\"," +
-                                $"\"{Safe(r.TryGetProperty("RequesterPhone", out var rp) ? rp.GetString() : "")}\"," +
-                                $"\"{Safe(r.TryGetProperty("RequesterMobile", out var rm) ? rm.GetString() : "")}\"," +
-                                $"\"{Safe(r.TryGetProperty("RequesterEmployeeId", out var eid) ? eid.GetString() : "")}\"," +
-                                $"\"{Safe(r.TryGetProperty("RequesterJobTitle", out var jt) ? jt.GetString() : "")}\"");
+                            sb.AppendLine(BuildRequestCsvLine(r));
                         }
                         break;
 
@@ -2270,9 +2553,68 @@ Generate a friendly, conversational response:";
 
             return Encoding.UTF8.GetBytes(sb.ToString());
         }
+
+        /// <summary>
+        /// Build a CSV line for a single request with ALL fields
+        /// </summary>
+        private string BuildRequestCsvLine(JsonElement r)
+        {
+            string Safe(object? value) => value?.ToString()?.Replace("\"", "\"\"").Replace("\n", " ").Replace("\r", "") ?? "";
+
+            var fields = new List<string>
+            {
+                Safe(r.TryGetProperty("Id", out var id) ? id.GetString() : ""),
+                Safe(r.TryGetProperty("DisplayId", out var did) ? did.GetString() : ""),
+                Safe(r.TryGetProperty("Subject", out var subj) ? subj.GetString() : ""),
+                Safe(r.TryGetProperty("Description", out var desc) ? desc.GetString() : ""),
+                Safe(r.TryGetProperty("Status", out var st) ? st.GetString() : ""),
+                Safe(r.TryGetProperty("StatusInternal", out var sti) ? sti.GetString() : ""),
+                r.TryGetProperty("CreatedTime", out var ct) ? ct.GetDateTime().ToString("yyyy-MM-dd HH:mm") : "",
+                Safe(r.TryGetProperty("DueByTime", out var dbt) ? dbt.GetString() : ""),
+                Safe(r.TryGetProperty("RespondedDate", out var rpd) ? rpd.GetString() : ""),
+                Safe(r.TryGetProperty("CompletedDate", out var cd) ? cd.GetString() : ""),
+                Safe(r.TryGetProperty("ResolvedTime", out var rt) ? rt.GetString() : ""),
+                Safe(r.TryGetProperty("LastUpdatedTime", out var lut) ? lut.GetString() : ""),
+                Safe(r.TryGetProperty("TechnicianName", out var tn) ? tn.GetString() : ""),
+                Safe(r.TryGetProperty("TechnicianEmail", out var te) ? te.GetString() : ""),
+                Safe(r.TryGetProperty("RequesterName", out var rn) ? rn.GetString() : ""),
+                Safe(r.TryGetProperty("RequesterEmail", out var re) ? re.GetString() : ""),
+                Safe(r.TryGetProperty("RequesterPhone", out var rp) ? rp.GetString() : ""),
+                Safe(r.TryGetProperty("RequesterMobile", out var rm) ? rm.GetString() : ""),
+                Safe(r.TryGetProperty("RequesterDepartment", out var rd) ? rd.GetString() : ""),
+                Safe(r.TryGetProperty("RequesterSite", out var rs) ? rs.GetString() : ""),
+                Safe(r.TryGetProperty("RequesterJobTitle", out var rjt) ? rjt.GetString() : ""),
+                Safe(r.TryGetProperty("RequesterEmployeeId", out var rei) ? rei.GetString() : ""),
+                Safe(r.TryGetProperty("Category", out var cat) ? cat.GetString() : ""),
+                Safe(r.TryGetProperty("Subcategory", out var scat) ? scat.GetString() : ""),
+                Safe(r.TryGetProperty("Item", out var item) ? item.GetString() : ""),
+                Safe(r.TryGetProperty("Priority", out var pri) ? pri.GetString() : ""),
+                Safe(r.TryGetProperty("Urgency", out var urg) ? urg.GetString() : ""),
+                Safe(r.TryGetProperty("Impact", out var imp) ? imp.GetString() : ""),
+                Safe(r.TryGetProperty("RequestType", out var rtype) ? rtype.GetString() : ""),
+                Safe(r.TryGetProperty("Level", out var lvl) ? lvl.GetString() : ""),
+                Safe(r.TryGetProperty("Mode", out var mode) ? mode.GetString() : ""),
+                Safe(r.TryGetProperty("Group", out var grp) ? grp.GetString() : ""),
+                Safe(r.TryGetProperty("Template", out var tmpl) ? tmpl.GetString() : ""),
+                Safe(r.TryGetProperty("Site", out var site) ? site.GetString() : ""),
+                Safe(r.TryGetProperty("Department", out var dept) ? dept.GetString() : ""),
+                r.TryGetProperty("IsServiceRequest", out var isr) ? isr.GetBoolean().ToString().ToLower() : "false",
+                r.TryGetProperty("HasNotes", out var hn) ? hn.GetBoolean().ToString().ToLower() : "false",
+                r.TryGetProperty("IsOverdue", out var iod) ? iod.GetBoolean().ToString().ToLower() : "false",
+                r.TryGetProperty("IsResponseOverdue", out var iro) ? iro.GetBoolean().ToString().ToLower() : "false",
+                Safe(r.TryGetProperty("Resolution", out var res) ? res.GetString() : ""),
+                Safe(r.TryGetProperty("ResolutionSubmittedBy", out var rsb) ? rsb.GetString() : ""),
+                Safe(r.TryGetProperty("ResolutionTime", out var restime) ? restime.GetString() : ""),
+                Safe(r.TryGetProperty("CreatedBy", out var cb) ? cb.GetString() : ""),
+                Safe(r.TryGetProperty("LastUpdatedBy", out var lub) ? lub.GetString() : ""),
+                Safe(r.TryGetProperty("OnBehalfOf", out var obo) ? obo.GetString() : "")
+            };
+
+            return string.Join(",", fields.Select(f => $"\"{f}\""));
+        }
     }
 
-    // Helper C
+    // Helper Classes
     public class NaturalQueryRequest
     {
         public string Query { get; set; }
@@ -2284,6 +2626,12 @@ Generate a friendly, conversational response:";
     {
         [JsonPropertyName("queryType")]
         public string QueryType { get; set; }
+
+        [JsonPropertyName("isConversational")]
+        public bool IsConversational { get; set; }
+
+        [JsonPropertyName("conversationalIntent")]
+        public string ConversationalIntent { get; set; }
 
         [JsonPropertyName("dateFrom")]
         public string DateFrom { get; set; }
@@ -2322,9 +2670,21 @@ Generate a friendly, conversational response:";
         public string Status { get; set; }
     }
 
-    // Data models
+    // COMPREHENSIVE Data models
     public class ManageEngineRequestData
     {
+        [JsonPropertyName("id")]
+        public string Id { get; set; }
+
+        [JsonPropertyName("display_id")]
+        public string DisplayId { get; set; }
+
+        [JsonPropertyName("subject")]
+        public string Subject { get; set; }
+
+        [JsonPropertyName("description")]
+        public string Description { get; set; }
+
         [JsonPropertyName("status")]
         public StatusInfo Status { get; set; }
 
@@ -2334,17 +2694,23 @@ Generate a friendly, conversational response:";
         [JsonPropertyName("technician")]
         public TechnicianInfo Technician { get; set; }
 
-        [JsonPropertyName("subject")]
-        public string Subject { get; set; }
-
         [JsonPropertyName("created_time")]
         public TimeInfo CreatedTime { get; set; }
 
         [JsonPropertyName("due_by_time")]
         public TimeInfo DueByTime { get; set; }
 
-        [JsonPropertyName("display_id")]
-        public string DisplayId { get; set; }
+        [JsonPropertyName("responded_time")]
+        public TimeInfo RespondedTime { get; set; }
+
+        [JsonPropertyName("completed_time")]
+        public TimeInfo CompletedTime { get; set; }
+
+        [JsonPropertyName("resolved_time")]
+        public TimeInfo ResolvedTime { get; set; }
+
+        [JsonPropertyName("last_updated_time")]
+        public TimeInfo LastUpdatedTime { get; set; }
 
         [JsonPropertyName("template")]
         public TemplateInfo Template { get; set; }
@@ -2352,20 +2718,62 @@ Generate a friendly, conversational response:";
         [JsonPropertyName("group")]
         public GroupInfo Group { get; set; }
 
+        [JsonPropertyName("category")]
+        public CategoryInfo Category { get; set; }
+
+        [JsonPropertyName("subcategory")]
+        public SubcategoryInfo Subcategory { get; set; }
+
+        [JsonPropertyName("item")]
+        public ItemInfo Item { get; set; }
+
+        [JsonPropertyName("priority")]
+        public PriorityInfo Priority { get; set; }
+
+        [JsonPropertyName("urgency")]
+        public UrgencyInfo Urgency { get; set; }
+
+        [JsonPropertyName("impact")]
+        public ImpactInfo Impact { get; set; }
+
+        [JsonPropertyName("level")]
+        public LevelInfo Level { get; set; }
+
+        [JsonPropertyName("mode")]
+        public ModeInfo Mode { get; set; }
+
+        [JsonPropertyName("request_type")]
+        public RequestTypeInfo RequestType { get; set; }
+
         [JsonPropertyName("is_service_request")]
         public bool IsServiceRequest { get; set; }
 
         [JsonPropertyName("has_notes")]
         public bool HasNotes { get; set; }
 
-        [JsonPropertyName("priority")]
-        public PriorityInfo Priority { get; set; }
+        [JsonPropertyName("is_overdue")]
+        public bool IsOverdue { get; set; }
 
-        [JsonPropertyName("category")]
-        public CategoryInfo Category { get; set; }
+        [JsonPropertyName("is_first_response_overdue")]
+        public bool IsFirstResponseOverdue { get; set; }
 
-        [JsonPropertyName("subcategory")]
-        public SubcategoryInfo Subcategory { get; set; }
+        [JsonPropertyName("resolution")]
+        public ResolutionInfo Resolution { get; set; }
+
+        [JsonPropertyName("site")]
+        public SiteInfo Site { get; set; }
+
+        [JsonPropertyName("department")]
+        public DepartmentInfo Department { get; set; }
+
+        [JsonPropertyName("created_by")]
+        public CreatedByInfo CreatedBy { get; set; }
+
+        [JsonPropertyName("last_updated_by")]
+        public LastUpdatedByInfo LastUpdatedBy { get; set; }
+
+        [JsonPropertyName("on_behalf_of")]
+        public OnBehalfOfInfo OnBehalfOf { get; set; }
     }
 
     public class StatusInfo
@@ -2465,5 +2873,80 @@ Generate a friendly, conversational response:";
     {
         [JsonPropertyName("name")]
         public string Name { get; set; }
+    }
+
+    public class ItemInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+    }
+
+    public class UrgencyInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+    }
+
+    public class ImpactInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+    }
+
+    public class LevelInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+    }
+
+    public class ModeInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+    }
+
+    public class RequestTypeInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+    }
+
+    public class ResolutionInfo
+    {
+        [JsonPropertyName("content")]
+        public string Content { get; set; }
+
+        [JsonPropertyName("submitted_by")]
+        public string SubmittedBy { get; set; }
+
+        [JsonPropertyName("submitted_on")]
+        public TimeInfo SubmittedOn { get; set; }
+    }
+
+    public class CreatedByInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+
+        [JsonPropertyName("email_id")]
+        public string EmailId { get; set; }
+    }
+
+    public class LastUpdatedByInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+
+        [JsonPropertyName("email_id")]
+        public string EmailId { get; set; }
+    }
+
+    public class OnBehalfOfInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
+
+        [JsonPropertyName("email_id")]
+        public string EmailId { get; set; }
     }
 }
