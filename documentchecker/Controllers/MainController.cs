@@ -821,7 +821,8 @@ Generate a friendly, conversational response:";
 
                     if (jsonElement.TryGetProperty("TopAreas", out var areas))
                     {
-                        foreach (var area in areas.EnumerateArray().Take(5))
+                        foreach (var area in areas.EnumerateArray().Take(5)
+                          )
                         {
                             var subject = area.TryGetProperty("Subject", out var s) ? s.GetString() : "Unknown";
                             var count = area.TryGetProperty("Count", out var c) ? c.GetInt32() : 0;
@@ -991,15 +992,33 @@ Generate a friendly, conversational response:";
                 query = query.Where(r => r.TechnicianName.ToLower().Contains(techLower));
             }
 
-            var allTechActivity = await query
+            // Phase 1: Get technician activity summary (this translates to SQL)
+            var techActivitySummary = await query
                 .GroupBy(r => r.TechnicianName)
                 .Select(g => new
                 {
                     Technician = g.Key,
                     TechnicianEmail = g.Select(r => r.TechnicianEmail).FirstOrDefault(e => !string.IsNullOrEmpty(e)),
                     LastActivity = g.Max(r => r.CreatedTime),
-                    TotalRequests = g.Count(),
-                    AllRequests = g.OrderByDescending(r => r.CreatedTime).Select(r => new
+                    TotalRequests = g.Count()
+                })
+                .ToListAsync();
+
+            // Phase 2: For inactive technicians, fetch their requests separately
+            var inactiveTechnicians = techActivitySummary
+                .Where(a => a.LastActivity < dateFrom)
+                .ToList();
+
+            var result = new List<object>();
+
+            foreach (var tech in inactiveTechnicians)
+            {
+                // Fetch requests for this technician
+                var techRequests = await _dbContext.ManageEngineRequests
+                    .Where(r => r.TechnicianName == tech.Technician)
+                    .OrderByDescending(r => r.CreatedTime)
+                    .Take(100) // Limit to prevent excessive data
+                    .Select(r => new
                     {
                         r.Id,
                         r.DisplayId,
@@ -1008,32 +1027,31 @@ Generate a friendly, conversational response:";
                         r.CreatedTime,
                         r.RequesterName,
                         r.RequesterEmail,
+                        r.TechnicianName,
+                        r.TechnicianEmail,
                         r.JsonData
-                    }).ToList()
-                })
-                .ToListAsync();
+                    })
+                    .ToListAsync();
 
-            var inactive = allTechActivity
-                .Where(a => a.LastActivity < dateFrom)
-                .Select(a => new
+                result.Add(new
                 {
-                    a.Technician,
-                    a.TechnicianEmail,
-                    a.LastActivity,
-                    a.TotalRequests,
-                    DaysInactive = (int)(dateTo - a.LastActivity).TotalDays,
-                    Requests = a.AllRequests.Select(r => ParseRequestDetails(r.JsonData, r)).ToList()
-                })
-                .ToList();
+                    tech.Technician,
+                    tech.TechnicianEmail,
+                    tech.LastActivity,
+                    tech.TotalRequests,
+                    DaysInactive = (int)(dateTo - tech.LastActivity).TotalDays,
+                    Requests = techRequests.Select(r => ParseRequestDetails(r.JsonData, r)).ToList()
+                });
+            }
 
             return new
             {
                 QueryType = "InactiveTechnicians",
                 InactivityPeriod = analysis.InactivityPeriod,
                 Period = $"From {dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}",
-                InactiveTechnicians = inactive,
-                TotalInactive = inactive.Count,
-                TotalTechnicians = allTechActivity.Count,
+                InactiveTechnicians = result,
+                TotalInactive = result.Count,
+                TotalTechnicians = techActivitySummary.Count,
                 Timestamp = DateTime.UtcNow
             };
         }
@@ -1065,24 +1083,46 @@ Generate a friendly, conversational response:";
                 query = query.Where(r => r.RequesterName.ToLower().Contains(reqLower));
             }
 
+            // Fetch all matching requests first (with lightweight projection)
             var allRequests = await query
                 .Select(r => new { r.CreatedTime, r.Id, r.DisplayId, r.Subject, r.Status, r.TechnicianName, r.RequesterName, r.JsonData })
                 .ToListAsync();
 
             if (timeUnit == "hour")
             {
-                var hourlyCounts = allRequests
+                // Group by hour in-memory
+                var hourlyGroups = allRequests
                     .GroupBy(r => new { Date = r.CreatedTime.Date, Hour = r.CreatedTime.Hour })
                     .Select(g => new
                     {
                         DateTime = new DateTime(g.Key.Date.Year, g.Key.Date.Month, g.Key.Date.Day, g.Key.Hour, 0, 0),
                         Count = g.Count(),
-                        Requests = g.Select(r => ParseRequestDetails(r.JsonData, r)).ToList()
+                        RequestIds = g.Select(r => (r.Id, r.DisplayId, r.Subject, r.Status, r.TechnicianName, r.RequesterName, r.JsonData)).ToList()
                     })
                     .OrderBy(x => x.DateTime)
                     .ToList();
 
-                var peakHour = hourlyCounts.OrderByDescending(x => x.Count).FirstOrDefault();
+                // Fetch detailed request data for each hour
+                var hourlyCounts = new List<object>();
+                foreach (var hourGroup in hourlyGroups)
+                {
+                    hourlyCounts.Add(new
+                    {
+                        hourGroup.DateTime,
+                        hourGroup.Count,
+                        Requests = hourGroup.RequestIds.Select(r => ParseRequestDetails(r.JsonData, new
+                        {
+                            Id = r.Id,
+                            DisplayId = r.DisplayId,
+                            Subject = r.Subject,
+                            Status = r.Status,
+                            TechnicianName = r.TechnicianName,
+                            RequesterName = r.RequesterName
+                        })).ToList()
+                    });
+                }
+
+                var peakHour = hourlyCounts.OrderByDescending(x => ((dynamic)x).Count).FirstOrDefault();
 
                 return new
                 {
@@ -1091,24 +1131,45 @@ Generate a friendly, conversational response:";
                     Period = $"From {dateFrom:yyyy-MM-dd HH:mm} to {dateTo:yyyy-MM-dd HH:mm}",
                     HourlyData = hourlyCounts,
                     PeakHour = peakHour,
-                    TotalRequests = hourlyCounts.Sum(x => x.Count),
+                    TotalRequests = hourlyCounts.Sum(x => ((dynamic)x).Count),
                     Timestamp = DateTime.UtcNow
                 };
             }
             else
             {
-                var dailyCounts = allRequests
+                // Group by day in-memory
+                var dailyGroups = allRequests
                     .GroupBy(r => r.CreatedTime.Date)
                     .Select(g => new
                     {
                         Date = g.Key,
                         Count = g.Count(),
-                        Requests = g.Select(r => ParseRequestDetails(r.JsonData, r)).ToList()
+                        RequestIds = g.Select(r => (r.Id, r.DisplayId, r.Subject, r.Status, r.TechnicianName, r.RequesterName, r.JsonData)).ToList()
                     })
                     .OrderBy(x => x.Date)
                     .ToList();
 
-                var peakDay = dailyCounts.OrderByDescending(x => x.Count).FirstOrDefault();
+                // Fetch detailed request data for each day
+                var dailyCounts = new List<object>();
+                foreach (var dayGroup in dailyGroups)
+                {
+                    dailyCounts.Add(new
+                    {
+                        dayGroup.Date,
+                        dayGroup.Count,
+                        Requests = dayGroup.RequestIds.Select(r => ParseRequestDetails(r.JsonData, new
+                        {
+                            Id = r.Id,
+                            DisplayId = r.DisplayId,
+                            Subject = r.Subject,
+                            Status = r.Status,
+                            TechnicianName = r.TechnicianName,
+                            RequesterName = r.RequesterName
+                        })).ToList()
+                    });
+                }
+
+                var peakDay = dailyCounts.OrderByDescending(x => ((dynamic)x).Count).FirstOrDefault();
 
                 return new
                 {
@@ -1117,7 +1178,7 @@ Generate a friendly, conversational response:";
                     Period = $"From {dateFrom:yyyy-MM-dd} to {dateTo:yyyy-MM-dd}",
                     DailyData = dailyCounts,
                     PeakDay = peakDay,
-                    TotalRequests = dailyCounts.Sum(x => x.Count),
+                    TotalRequests = dailyCounts.Sum(x => ((dynamic)x).Count),
                     Timestamp = DateTime.UtcNow
                 };
             }
@@ -1150,13 +1211,28 @@ Generate a friendly, conversational response:";
                 query = query.Where(r => r.RequesterName.ToLower().Contains(reqLower));
             }
 
-            var topAreas = await query
+            // Phase 1: Get area statistics (this translates to SQL)
+            var areaStats = await query
                 .GroupBy(r => r.Subject)
                 .Select(g => new
                 {
                     Subject = g.Key,
-                    Count = g.Count(),
-                    Requests = g.OrderByDescending(r => r.CreatedTime).Select(r => new
+                    Count = g.Count()
+                })
+                .OrderByDescending(x => x.Count)
+                .Take(topN)
+                .ToListAsync();
+
+            // Phase 2: Fetch detailed requests for each top area
+            var detailedAreas = new List<object>();
+
+            foreach (var area in areaStats)
+            {
+                var areaRequests = await query
+                    .Where(r => r.Subject == area.Subject)
+                    .OrderByDescending(r => r.CreatedTime)
+                    .Take(100) // Limit per subject area
+                    .Select(r => new
                     {
                         r.Id,
                         r.DisplayId,
@@ -1168,18 +1244,16 @@ Generate a friendly, conversational response:";
                         r.TechnicianName,
                         r.TechnicianEmail,
                         r.JsonData
-                    }).ToList()
-                })
-                .OrderByDescending(x => x.Count)
-                .Take(topN)
-                .ToListAsync();
+                    })
+                    .ToListAsync();
 
-            var detailedAreas = topAreas.Select(area => new
-            {
-                area.Subject,
-                area.Count,
-                Requests = area.Requests.Select(r => ParseRequestDetails(r.JsonData, r)).ToList()
-            }).ToList();
+                detailedAreas.Add(new
+                {
+                    area.Subject,
+                    area.Count,
+                    Requests = areaRequests.Select(r => ParseRequestDetails(r.JsonData, r)).ToList()
+                });
+            }
 
             return new
             {
@@ -1188,7 +1262,7 @@ Generate a friendly, conversational response:";
                 TopN = topN,
                 TopAreas = detailedAreas,
                 TotalAreas = detailedAreas.Count,
-                TotalRequests = detailedAreas.Sum(x => x.Count),
+                TotalRequests = detailedAreas.Sum(x => ((dynamic)x).Count),
                 Timestamp = DateTime.UtcNow
             };
         }
@@ -1225,34 +1299,46 @@ Generate a friendly, conversational response:";
                 query = ApplyStatusFilter(query, analysis.Status);
             }
 
+            // Phase 1: Get technician statistics (translates to SQL)
             var technicianStats = await query
                 .GroupBy(r => r.TechnicianName)
                 .Select(g => new
                 {
                     Technician = g.Key,
                     TechnicianEmail = g.Select(r => r.TechnicianEmail).FirstOrDefault(e => !string.IsNullOrEmpty(e)),
-                    RequestsHandled = g.Count(),
-                    AllRequests = g.OrderByDescending(r => r.CreatedTime)
-                                     .Select(r => new
-                                     {
-                                         r.Id,
-                                         r.DisplayId,
-                                         r.Subject,
-                                         r.Status,
-                                         r.CreatedTime,
-                                         r.RequesterName,
-                                         r.RequesterEmail,
-                                         r.JsonData
-                                     }).ToList()
+                    RequestsHandled = g.Count()
                 })
                 .OrderByDescending(x => x.RequestsHandled)
                 .Take(topN)
                 .ToListAsync();
 
-            var detailedStats = technicianStats.Select(tech =>
+            // Phase 2: Fetch detailed requests for each top technician
+            var detailedStats = new List<object>();
+
+            foreach (var tech in technicianStats)
             {
-                var parsedRequests = tech.AllRequests.Select(r => ParseRequestDetails(r.JsonData, r)).ToList();
-                return new
+                var techRequests = await query
+                    .Where(r => r.TechnicianName == tech.Technician)
+                    .OrderByDescending(r => r.CreatedTime)
+                    .Take(500) // Limit per technician
+                    .Select(r => new
+                    {
+                        r.Id,
+                        r.DisplayId,
+                        r.Subject,
+                        r.Status,
+                        r.CreatedTime,
+                        r.RequesterName,
+                        r.RequesterEmail,
+                        r.TechnicianName,
+                        r.TechnicianEmail,
+                        r.JsonData
+                    })
+                    .ToListAsync();
+
+                var parsedRequests = techRequests.Select(r => ParseRequestDetails(r.JsonData, r)).ToList();
+
+                detailedStats.Add(new
                 {
                     tech.Technician,
                     tech.TechnicianEmail,
@@ -1260,8 +1346,8 @@ Generate a friendly, conversational response:";
                     OpenRequests = parsedRequests.Count(r => IsOpenStatus(r.StatusInternal)),
                     ClosedRequests = parsedRequests.Count(r => IsClosedStatus(r.StatusInternal)),
                     Requests = parsedRequests
-                };
-            }).ToList();
+                });
+            }
 
             return new
             {
@@ -1270,7 +1356,7 @@ Generate a friendly, conversational response:";
                 TopN = topN,
                 TopTechnicians = detailedStats,
                 TotalTechnicians = detailedStats.Count,
-                TotalRequests = detailedStats.Sum(x => x.RequestsHandled),
+                TotalRequests = detailedStats.Sum(x => ((dynamic)x).RequestsHandled),
                 Timestamp = DateTime.UtcNow
             };
         }
@@ -1595,7 +1681,7 @@ Generate a friendly, conversational response:";
                         var peakDate = peak.GetProperty("Date").GetDateTime();
                         var peakCount = peak.GetProperty("Count").GetInt32();
                         sb.AppendLine($"Request influx by day. Total: {influxTotal}");
-                        sb.AppendLine($"Peak: {peakDate:MMM dd} with {peakCount} requests");
+                        sb.AppendLine($"Peak: {peakDate:MMM dd} with {peakCount} requests.");
                     }
                     break;
 
@@ -2089,7 +2175,7 @@ Generate a friendly, conversational response:";
                         break;
 
                     case "TopRequestAreas":
-                        sb.AppendLine("Subject,Total Count,Request ID,Display ID,Status,Created Time,Technician,Technician Email,Requester,Requester Email,Department,Priority");
+                        sb.AppendLine("Subject,Total Count,Request ID,Display ID,Status,Created Time,Technician,Requester,Priority");
                         foreach (var area in data.GetProperty("TopAreas").EnumerateArray())
                         {
                             var subject = Safe(area.GetProperty("Subject").GetString());
