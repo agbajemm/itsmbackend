@@ -2298,11 +2298,48 @@ Generate a friendly, conversational response:";
                     .Trim();
             }
 
+            // Extract meaningful value from nested JSON objects
+            string ExtractValueFromObject(JsonElement element, string fieldName)
+            {
+                // For time fields, prefer display_value
+                if (element.TryGetProperty("display_value", out var displayValue))
+                {
+                    return displayValue.GetString() ?? "";
+                }
+
+                // For entities like requester, technician, group, status, etc., prefer name
+                if (element.TryGetProperty("name", out var nameValue))
+                {
+                    var name = nameValue.GetString() ?? "";
+
+                    // For requester/technician, optionally include email
+                    if ((fieldName.Contains("requester") || fieldName.Contains("technician") ||
+                         fieldName.Contains("created_by") || fieldName.Contains("last_updated_by")) &&
+                        element.TryGetProperty("email_id", out var emailValue))
+                    {
+                        var email = emailValue.GetString();
+                        if (!string.IsNullOrEmpty(email) && !string.IsNullOrEmpty(name))
+                        {
+                            return $"{name} ({email})";
+                        }
+                    }
+                    return name;
+                }
+
+                // For display_key style fields
+                if (element.TryGetProperty("value", out var val))
+                {
+                    return val.ToString();
+                }
+
+                // Fallback: return empty for complex nested objects we can't parse
+                return "";
+            }
+
             try
             {
                 if (!string.IsNullOrEmpty(jsonData))
                 {
-                    // Parse the flat JSON structure
                     var jsonDoc = JsonDocument.Parse(jsonData);
                     var root = jsonDoc.RootElement;
 
@@ -2311,30 +2348,63 @@ Generate a friendly, conversational response:";
                         var key = property.Name;
                         var value = property.Value;
 
-                        // Get the value based on type
-                        object parsedValue = value.ValueKind switch
-                        {
-                            JsonValueKind.String => value.GetString() ?? "",
-                            JsonValueKind.Number => value.TryGetInt64(out var l) ? l : value.GetDouble(),
-                            JsonValueKind.True => true,
-                            JsonValueKind.False => false,
-                            JsonValueKind.Null => "",
-                            _ => value.GetRawText()
-                        };
+                        object parsedValue;
 
-                        // Special handling for Description - strip HTML
+                        switch (value.ValueKind)
+                        {
+                            case JsonValueKind.String:
+                                parsedValue = value.GetString() ?? "";
+                                break;
+                            case JsonValueKind.Number:
+                                parsedValue = value.TryGetInt64(out var l) ? l : value.GetDouble();
+                                break;
+                            case JsonValueKind.True:
+                                parsedValue = true;
+                                break;
+                            case JsonValueKind.False:
+                                parsedValue = false;
+                                break;
+                            case JsonValueKind.Null:
+                                parsedValue = "";
+                                break;
+                            case JsonValueKind.Object:
+                                // KEY FIX: Extract meaningful value from nested object
+                                parsedValue = ExtractValueFromObject(value, key.ToLower());
+                                break;
+                            case JsonValueKind.Array:
+                                var items = new List<string>();
+                                foreach (var item in value.EnumerateArray())
+                                {
+                                    if (item.ValueKind == JsonValueKind.String)
+                                    {
+                                        items.Add(item.GetString() ?? "");
+                                    }
+                                    else if (item.ValueKind == JsonValueKind.Object)
+                                    {
+                                        var extracted = ExtractValueFromObject(item, key.ToLower());
+                                        if (!string.IsNullOrEmpty(extracted))
+                                            items.Add(extracted);
+                                    }
+                                }
+                                parsedValue = string.Join(", ", items);
+                                break;
+                            default:
+                                parsedValue = "";
+                                break;
+                        }
+
                         if (key.Equals("Description", StringComparison.OrdinalIgnoreCase))
                         {
                             parsedValue = StripHtml(parsedValue?.ToString() ?? "");
                         }
 
-                        // Handle "-" as empty
                         if (parsedValue?.ToString() == "-")
                         {
                             parsedValue = "";
                         }
 
-                        result[key] = parsedValue;
+                        var formattedKey = FormatColumnName(key);
+                        result[formattedKey] = parsedValue;
                     }
                 }
             }
@@ -2344,23 +2414,23 @@ Generate a friendly, conversational response:";
             }
 
             // Add basic request fields if not present from JSON
-            if (!result.ContainsKey("Id") && basicRequest?.Id != null)
+            if (!result.ContainsKey("Id") && !result.ContainsKey("ID") && basicRequest?.Id != null)
                 result["Id"] = basicRequest.Id?.ToString() ?? "";
-            if (!result.ContainsKey("DisplayId") && basicRequest?.DisplayId != null)
-                result["DisplayId"] = basicRequest.DisplayId?.ToString() ?? "";
+            if (!result.ContainsKey("Request ID") && !result.ContainsKey("Display Id") && basicRequest?.DisplayId != null)
+                result["Request ID"] = basicRequest.DisplayId?.ToString() ?? "";
             if (!result.ContainsKey("Subject") && basicRequest?.Subject != null)
                 result["Subject"] = basicRequest.Subject?.ToString() ?? "";
             if (!result.ContainsKey("Status") && basicRequest?.Status != null)
                 result["Status"] = basicRequest.Status?.ToString() ?? "";
-            if (!result.ContainsKey("TechnicianName") && basicRequest?.TechnicianName != null)
+            if (!result.ContainsKey("Technician") && basicRequest?.TechnicianName != null)
                 result["Technician"] = basicRequest.TechnicianName?.ToString() ?? "";
-            if (!result.ContainsKey("RequesterName") && basicRequest?.RequesterName != null)
-                result["Requester Name"] = basicRequest.RequesterName?.ToString() ?? "";
-            if (!result.ContainsKey("CreatedTime") && basicRequest?.CreatedTime != null)
+            if (!result.ContainsKey("Requester") && basicRequest?.RequesterName != null)
+                result["Requester"] = basicRequest.RequesterName?.ToString() ?? "";
+            if (!result.ContainsKey("Created Time") && basicRequest?.CreatedTime != null)
             {
                 try
                 {
-                    result["Created Date"] = ((DateTime)basicRequest.CreatedTime).ToString("yyyy-MM-dd HH:mm:ss");
+                    result["Created Time"] = ((DateTime)basicRequest.CreatedTime).ToString("yyyy-MM-dd HH:mm:ss");
                 }
                 catch { }
             }
@@ -2606,6 +2676,38 @@ Generate a friendly, conversational response:";
         {
             var dict = new Dictionary<string, object>();
 
+            string ExtractValueFromObject(JsonElement obj, string fieldName)
+            {
+                if (obj.TryGetProperty("display_value", out var displayValue))
+                {
+                    return displayValue.GetString() ?? "";
+                }
+
+                if (obj.TryGetProperty("name", out var nameValue))
+                {
+                    var name = nameValue.GetString() ?? "";
+
+                    if ((fieldName.Contains("requester") || fieldName.Contains("technician") ||
+                         fieldName.Contains("created_by") || fieldName.Contains("last_updated_by")) &&
+                        obj.TryGetProperty("email_id", out var emailValue))
+                    {
+                        var email = emailValue.GetString();
+                        if (!string.IsNullOrEmpty(email) && !string.IsNullOrEmpty(name))
+                        {
+                            return $"{name} ({email})";
+                        }
+                    }
+                    return name;
+                }
+
+                if (obj.TryGetProperty("value", out var val))
+                {
+                    return val.ToString();
+                }
+
+                return "";
+            }
+
             if (element.ValueKind == JsonValueKind.Object)
             {
                 foreach (var property in element.EnumerateObject())
@@ -2613,25 +2715,56 @@ Generate a friendly, conversational response:";
                     var key = property.Name;
                     var value = property.Value;
 
-                    object parsedValue = value.ValueKind switch
-                    {
-                        JsonValueKind.String => value.GetString() ?? "",
-                        JsonValueKind.Number => value.TryGetInt64(out var l) ? l : value.GetDouble(),
-                        JsonValueKind.True => "true",
-                        JsonValueKind.False => "false",
-                        JsonValueKind.Null => "",
-                        JsonValueKind.Object => "", // Skip nested objects for CSV
-                        JsonValueKind.Array => "", // Skip arrays for CSV
-                        _ => ""
-                    };
+                    object parsedValue;
 
-                    // Handle "-" as empty
+                    switch (value.ValueKind)
+                    {
+                        case JsonValueKind.String:
+                            parsedValue = value.GetString() ?? "";
+                            break;
+                        case JsonValueKind.Number:
+                            parsedValue = value.TryGetInt64(out var l) ? l : value.GetDouble();
+                            break;
+                        case JsonValueKind.True:
+                            parsedValue = "true";
+                            break;
+                        case JsonValueKind.False:
+                            parsedValue = "false";
+                            break;
+                        case JsonValueKind.Null:
+                            parsedValue = "";
+                            break;
+                        case JsonValueKind.Object:
+                            // KEY FIX: Extract meaningful value from nested object
+                            parsedValue = ExtractValueFromObject(value, key.ToLower());
+                            break;
+                        case JsonValueKind.Array:
+                            var items = new List<string>();
+                            foreach (var item in value.EnumerateArray())
+                            {
+                                if (item.ValueKind == JsonValueKind.String)
+                                {
+                                    items.Add(item.GetString() ?? "");
+                                }
+                                else if (item.ValueKind == JsonValueKind.Object)
+                                {
+                                    var extracted = ExtractValueFromObject(item, key.ToLower());
+                                    if (!string.IsNullOrEmpty(extracted))
+                                        items.Add(extracted);
+                                }
+                            }
+                            parsedValue = string.Join(", ", items);
+                            break;
+                        default:
+                            parsedValue = "";
+                            break;
+                    }
+
                     if (parsedValue?.ToString() == "-")
                     {
                         parsedValue = "";
                     }
 
-                    // Strip HTML from Description
                     if (key.Equals("Description", StringComparison.OrdinalIgnoreCase) && parsedValue is string descStr)
                     {
                         parsedValue = System.Text.RegularExpressions.Regex.Replace(descStr, "<[^>]*>", " ")
@@ -2643,11 +2776,97 @@ Generate a friendly, conversational response:";
                             .Trim();
                     }
 
-                    dict[key] = parsedValue;
+                    var formattedKey = FormatColumnName(key);
+                    dict[formattedKey] = parsedValue;
                 }
             }
 
             return dict;
+        }
+
+        private string FormatColumnName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return name;
+
+            // Handle common field name mappings for cleaner output
+            var mappings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        { "id", "ID" },
+        { "display_id", "Request ID" },
+        { "display_key", "Display Key" },
+        { "created_time", "Created Time" },
+        { "due_by_time", "Due By Time" },
+        { "responded_time", "Responded Time" },
+        { "completed_time", "Completed Time" },
+        { "resolved_time", "Resolved Time" },
+        { "last_updated_time", "Last Updated Time" },
+        { "requester", "Requester" },
+        { "technician", "Technician" },
+        { "group", "Group" },
+        { "status", "Status" },
+        { "subject", "Subject" },
+        { "description", "Description" },
+        { "template", "Template" },
+        { "category", "Category" },
+        { "subcategory", "Sub Category" },
+        { "item", "Item" },
+        { "priority", "Priority" },
+        { "urgency", "Urgency" },
+        { "impact", "Impact" },
+        { "level", "Level" },
+        { "mode", "Mode" },
+        { "site", "Site" },
+        { "department", "Department" },
+        { "request_type", "Request Type" },
+        { "is_service_request", "Is Service Request" },
+        { "has_notes", "Has Notes" },
+        { "is_overdue", "Is Overdue" },
+        { "is_first_response_overdue", "Is Response Overdue" },
+        { "resolution", "Resolution" },
+        { "created_by", "Created By" },
+        { "last_updated_by", "Last Updated By" },
+        { "on_behalf_of", "On Behalf Of" },
+        { "email_id", "Email" },
+        { "phone", "Phone" },
+        { "mobile", "Mobile" },
+        { "job_title", "Job Title" },
+        { "employee_id", "Employee ID" }
+    };
+
+            if (mappings.TryGetValue(name, out var mapped))
+            {
+                return mapped;
+            }
+
+            // Convert snake_case to Title Case
+            var result = new StringBuilder();
+            bool capitalizeNext = true;
+
+            foreach (char c in name)
+            {
+                if (c == '_' || c == '-')
+                {
+                    result.Append(' ');
+                    capitalizeNext = true;
+                }
+                else if (char.IsUpper(c) && result.Length > 0 && !char.IsWhiteSpace(result[result.Length - 1]))
+                {
+                    result.Append(' ');
+                    result.Append(c);
+                    capitalizeNext = false;
+                }
+                else if (capitalizeNext)
+                {
+                    result.Append(char.ToUpper(c));
+                    capitalizeNext = false;
+                }
+                else
+                {
+                    result.Append(char.ToLower(c));
+                }
+            }
+
+            return result.ToString();
         }
     }
 
