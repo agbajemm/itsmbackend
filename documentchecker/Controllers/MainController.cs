@@ -125,7 +125,7 @@ namespace documentchecker.Controllers
 
             try
             {
-                // Background sync (fire and forget)
+                // Background sync (fire and forget))
                 _ = Task.Run(async () =>
                 {
                     try
